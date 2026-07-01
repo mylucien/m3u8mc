@@ -38,11 +38,8 @@ jobs:
         run: cargo test --workspace --verbose
 
   validate-makefile:
-    name: Validate Makefile & package structure
+    name: Validate Makefiles & package structure
     runs-on: ubuntu-22.04
-    defaults:
-      run:
-        working-directory: openwrt-package
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,91 +47,89 @@ jobs:
       - name: Check for comments inside define blocks
         run: |
           errors=0
-          in_block=""
-          while IFS= read -r line; do
-            if echo "$line" | grep -q "^define "; then
-              in_block="yes"
-              continue
-            fi
-            if echo "$line" | grep -q "^endef"; then
-              in_block=""
-              continue
-            fi
-            if [ -n "$in_block" ] && echo "$line" | grep -qE "^\s+#"; then
-              echo "::error file=Makefile::Comment found inside define block: $line"
-              errors=$((errors + 1))
-            fi
-          done < Makefile
+          for mf in openwrt-package/m3u8mc/Makefile openwrt-package/luci-app-m3u8mc/Makefile; do
+            echo "Checking $mf..."
+            in_block=""
+            while IFS= read -r line; do
+              if echo "$line" | grep -q "^define "; then
+                in_block="yes"
+                continue
+              fi
+              if echo "$line" | grep -q "^endef"; then
+                in_block=""
+                continue
+              fi
+              if [ -n "$in_block" ] && echo "$line" | grep -qE "^\s+#"; then
+                echo "::error file=$mf::Comment found inside define block: $line"
+                errors=$((errors + 1))
+              fi
+            done < "$mf"
+          done
           if [ "$errors" -gt 0 ]; then
-            echo "❌ Found $errors comment(s) inside define blocks"
+            echo "Found $errors comment(s) inside define blocks"
             exit 1
           fi
-          echo "✅ No comments inside define blocks"
+          echo "No comments inside define blocks"
 
-      - name: Verify required fields in Package/m3u8mc
+      - name: Verify required fields in Makefiles
         run: |
-          for field in SECTION CATEGORY TITLE DEPENDS; do
-            if grep -q "^\s*${field}:=" Makefile; then
-              echo "✅ Found $field"
+          for mf in openwrt-package/m3u8mc/Makefile openwrt-package/luci-app-m3u8mc/Makefile; do
+            echo "=== $mf ==="
+            for field in SECTION CATEGORY TITLE; do
+              if grep -q "^\s*${field}:=" "$mf"; then
+                echo "  $field OK"
+              else
+                echo "::error file=$mf::$field is missing"
+                exit 1
+              fi
+            done
+            # DEPENDS is optional for luci packages (but should exist)
+            if grep -q "^\s*DEPENDS:=" "$mf"; then
+              deps=$(grep "^\s*DEPENDS:=" "$mf" | sed 's/.*DEPENDS:=//')
+              if echo "$deps" | grep -q "libxz"; then
+                echo "::error file=$mf::DEPENDS contains libxz - use liblzma instead"
+                exit 1
+              fi
+              echo "  DEPENDS=$deps OK"
+            fi
+            if grep -q "^\s*SUBMENU:=" "$mf"; then
+              echo "  SUBMENU set"
             else
-              echo "::error file=Makefile::$field is missing in Package/m3u8mc"
-              exit 1
+              echo "  SUBMENU missing (warning)"
             fi
           done
-
-      - name: Verify SUBMENU is set
-        run: |
-          if grep -q "^\s*SUBMENU:=" Makefile; then
-            echo "✅ SUBMENU is set"
-          else
-            echo "::warning file=Makefile::SUBMENU is missing - package may be invisible in menuconfig"
-          fi
-
-      - name: Verify dependency names are valid
-        run: |
-          deps=$(grep "^\s*DEPENDS:=" Makefile | sed 's/.*DEPENDS:=//')
-          echo "Dependencies: $deps"
-          # Check for known invalid package names
-          if echo "$deps" | grep -q "libxz"; then
-            echo "::error file=Makefile::DEPENDS contains 'libxz' - use 'liblzma' instead"
-            exit 1
-          fi
-          echo "✅ Dependency names look valid"
 
       - name: Verify required files exist
         run: |
-          required=(
-            "files/m3u8mc.init"
-            "files/m3u8mc.config"
-            "files/ffmpeg-install.sh"
-            "luci/controller/m3u8mc.lua"
-            "luci/model/cbi/m3u8mc/channels.lua"
-            "luci/model/cbi/m3u8mc/isolation.lua"
-            "luci/view/m3u8mc/status.htm"
-            "luci/view/m3u8mc/ffmpeg.htm"
-            "luci/htdocs/m3u8mc-status.js"
-          )
           missing=0
-          for f in "${required[@]}"; do
-            if [ -f "$f" ]; then
-              echo "✅ $f"
-            else
-              echo "::error file=$f::$f is missing"
-              missing=$((missing + 1))
-            fi
+          required_m3u8mc=(
+            "openwrt-package/m3u8mc/files/m3u8mc.init"
+            "openwrt-package/m3u8mc/files/m3u8mc.config"
+            "openwrt-package/m3u8mc/files/ffmpeg-install.sh"
+          )
+          for f in "${required_m3u8mc[@]}"; do
+            if [ -f "$f" ]; then echo "$f"; else echo "::error file=$f::missing"; missing=$((missing+1)); fi
           done
-          if [ "$missing" -gt 0 ]; then
-            echo "❌ $missing required file(s) missing"
-            exit 1
-          fi
-          echo "✅ All required files present"
+          required_luci=(
+            "openwrt-package/luci-app-m3u8mc/luci/controller/m3u8mc.lua"
+            "openwrt-package/luci-app-m3u8mc/luci/model/cbi/m3u8mc/channels.lua"
+            "openwrt-package/luci-app-m3u8mc/luci/model/cbi/m3u8mc/isolation.lua"
+            "openwrt-package/luci-app-m3u8mc/luci/view/m3u8mc/status.htm"
+            "openwrt-package/luci-app-m3u8mc/luci/view/m3u8mc/ffmpeg.htm"
+            "openwrt-package/luci-app-m3u8mc/luci/htdocs/m3u8mc-status.js"
+          )
+          for f in "${required_luci[@]}"; do
+            if [ -f "$f" ]; then echo "$f"; else echo "::error file=$f::missing"; missing=$((missing+1)); fi
+          done
+          if [ "$missing" -gt 0 ]; then echo "$missing file(s) missing"; exit 1; fi
+          echo "All required files present"
 
   validate-binaries:
     name: Check prebuilt binaries
     runs-on: ubuntu-22.04
     defaults:
       run:
-        working-directory: openwrt-package
+        working-directory: openwrt-package/m3u8mc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -195,21 +190,24 @@ jobs:
           mv /tmp/immortalwrt-sdk-* /tmp/immortalwrt-sdk
           echo "SDK ready at /tmp/immortalwrt-sdk"
 
-      - name: Link m3u8mc and compile ipk
+      - name: Link packages and compile
         run: |
           SDK_DIR=/tmp/immortalwrt-sdk
           export TERM=linux
-          ln -s "${{ github.workspace }}/m3u8mc/openwrt-package" \
+          # 分别 link 两个独立包
+          ln -s "${{ github.workspace }}/m3u8mc/openwrt-package/m3u8mc" \
             "$SDK_DIR/package/m3u8mc"
+          ln -s "${{ github.workspace }}/m3u8mc/openwrt-package/luci-app-m3u8mc" \
+            "$SDK_DIR/package/luci-app-m3u8mc"
+          ls -la "$SDK_DIR/package/m3u8mc/Makefile"
+          ls -la "$SDK_DIR/package/luci-app-m3u8mc/Makefile"
+
           cd "$SDK_DIR"
           export TERM=linux
           make defconfig 2>&1
-          # 显式启用 luci 子包（defconfig 不会自动包含）
-          echo "CONFIG_PACKAGE_luci-app-m3u8mc=m" >> .config
-          make defconfig 2>&1
           echo "Config ready"
 
-          # 先编译 m3u8mc（核心包，使用预编译二进制）
+          # 编译 m3u8mc
           RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
             make package/m3u8mc/compile V=s 2>&1 || {
             echo "m3u8mc compilation failed"
@@ -217,9 +215,8 @@ jobs:
           }
           echo "m3u8mc compiled"
 
-          # 再编译 luci 包（纯脚本文件，无工具链依赖）
-          RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
-            make package/luci-app-m3u8mc/compile V=s 2>&1 || {
+          # 编译 luci-app-m3u8mc（纯文件复制，秒级）
+          make package/luci-app-m3u8mc/compile V=s 2>&1 || {
             echo "luci-app-m3u8mc compilation failed"
             exit 1
           }

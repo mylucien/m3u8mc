@@ -1,0 +1,53 @@
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=luci-app-m3u8mc
+PKG_VERSION:=0.1.0
+PKG_RELEASE:=1
+PKG_MAINTAINER:=wupengyan
+PKG_LICENSE:=MIT
+
+PKGARCH:=all
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/luci-app-m3u8mc
+  SECTION:=luci
+  CATEGORY:=LuCI
+  SUBMENU:=3. Applications
+  TITLE:=LuCI support for m3u8mc
+  DEPENDS:=+m3u8mc +luci-base
+  PKGARCH:=all
+endef
+
+define Package/luci-app-m3u8mc/description
+  LuCI management interface for m3u8mc: channel management,
+  network isolation, FFmpeg download/install, and status monitoring.
+endef
+
+define Build/Compile
+	@true
+endef
+
+define Package/luci-app-m3u8mc/install
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/controller
+	$(INSTALL_DATA) ./luci/controller/m3u8mc.lua \
+	    $(1)/usr/lib/lua/luci/controller/m3u8mc.lua
+
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/model/cbi/m3u8mc
+	$(INSTALL_DATA) ./luci/model/cbi/m3u8mc/channels.lua \
+	    $(1)/usr/lib/lua/luci/model/cbi/m3u8mc/channels.lua
+	$(INSTALL_DATA) ./luci/model/cbi/m3u8mc/isolation.lua \
+	    $(1)/usr/lib/lua/luci/model/cbi/m3u8mc/isolation.lua
+
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/view/m3u8mc
+	$(INSTALL_DATA) ./luci/view/m3u8mc/status.htm \
+	    $(1)/usr/lib/lua/luci/view/m3u8mc/status.htm
+	$(INSTALL_DATA) ./luci/view/m3u8mc/ffmpeg.htm \
+	    $(1)/usr/lib/lua/luci/view/m3u8mc/ffmpeg.htm
+
+	$(INSTALL_DIR) $(1)/www/luci-static/resources
+	$(INSTALL_DATA) ./luci/htdocs/m3u8mc-status.js \
+	    $(1)/www/luci-static/resources/m3u8mc-status.js
+endef
+
+$(eval $(call BuildPackage,luci-app-m3u8mc))
