@@ -1,0 +1,168 @@
+# 检验插件：验证 openwrt-package Makefile 和 Rust 源码
+#
+# 每次 push / PR 自动运行：
+#   1. 检查 Makefile 格式（无注释在 define 块内等）
+#   2. 检查必要文件齐全
+#   3. 运行 Rust 单元测试
+#   4. 验证预编译二进制存在且是合法 ELF
+
+name: check
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-tests:
+    name: Rust unit tests
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+  validate-makefile:
+    name: Validate Makefile & package structure
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: openwrt-package
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for comments inside define blocks
+        run: |
+          errors=0
+          in_block=""
+          while IFS= read -r line; do
+            if echo "$line" | grep -q "^define "; then
+              in_block="yes"
+              continue
+            fi
+            if echo "$line" | grep -q "^endef"; then
+              in_block=""
+              continue
+            fi
+            if [ -n "$in_block" ] && echo "$line" | grep -qE "^\s+#"; then
+              echo "::error file=Makefile::Comment found inside define block: $line"
+              errors=$((errors + 1))
+            fi
+          done < Makefile
+          if [ "$errors" -gt 0 ]; then
+            echo "❌ Found $errors comment(s) inside define blocks"
+            exit 1
+          fi
+          echo "✅ No comments inside define blocks"
+
+      - name: Verify required fields in Package/m3u8mc
+        run: |
+          for field in SECTION CATEGORY TITLE DEPENDS; do
+            if grep -q "^\s*${field}:=" Makefile; then
+              echo "✅ Found $field"
+            else
+              echo "::error file=Makefile::$field is missing in Package/m3u8mc"
+              exit 1
+            fi
+          done
+
+      - name: Verify SUBMENU is set
+        run: |
+          if grep -q "^\s*SUBMENU:=" Makefile; then
+            echo "✅ SUBMENU is set"
+          else
+            echo "::warning file=Makefile::SUBMENU is missing - package may be invisible in menuconfig"
+          fi
+
+      - name: Verify dependency names are valid
+        run: |
+          deps=$(grep "^\s*DEPENDS:=" Makefile | sed 's/.*DEPENDS:=//')
+          echo "Dependencies: $deps"
+          # Check for known invalid package names
+          if echo "$deps" | grep -q "libxz"; then
+            echo "::error file=Makefile::DEPENDS contains 'libxz' - use 'liblzma' instead"
+            exit 1
+          fi
+          echo "✅ Dependency names look valid"
+
+      - name: Verify required files exist
+        run: |
+          required=(
+            "files/m3u8mc.init"
+            "files/m3u8mc.config"
+            "files/ffmpeg-install.sh"
+            "luci/controller/m3u8mc.lua"
+            "luci/model/cbi/m3u8mc/channels.lua"
+            "luci/model/cbi/m3u8mc/isolation.lua"
+            "luci/view/m3u8mc/status.htm"
+            "luci/view/m3u8mc/ffmpeg.htm"
+            "luci/htdocs/m3u8mc-status.js"
+          )
+          missing=0
+          for f in "${required[@]}"; do
+            if [ -f "$f" ]; then
+              echo "✅ $f"
+            else
+              echo "::error file=$f::$f is missing"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "❌ $missing required file(s) missing"
+            exit 1
+          fi
+          echo "✅ All required files present"
+
+  validate-binaries:
+    name: Check prebuilt binaries
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: openwrt-package
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify prebuilt binaries are valid ELF files
+        run: |
+          failures=0
+          for triple_dir in bin/*/; do
+            triple=$(basename "$triple_dir")
+            for bin in m3u8mcd m3u8mcctl; do
+              path="${triple_dir}${bin}"
+              if [ ! -f "$path" ]; then
+                echo "::warning::Missing $bin for $triple"
+                continue
+              fi
+              size=$(stat -c%s "$path")
+              if ! file "$path" | grep -q "ELF"; then
+                echo "::error file=$path::$bin for $triple is not a valid ELF binary"
+                failures=$((failures + 1))
+              elif [ "$size" -lt 100000 ]; then
+                echo "::warning file=$path::$bin for $triple is suspiciously small (${size} bytes)"
+              else
+                echo "✅ $triple/$bin: ELF verified, ${size} bytes"
+              fi
+            done
+          done
+          if [ "$failures" -gt 0 ]; then
+            echo "❌ $failures binary verification(s) failed"
+            exit 1
+          fi
+          echo "✅ All prebuilt binaries are valid"
