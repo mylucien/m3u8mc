@@ -166,3 +166,58 @@ jobs:
             exit 1
           fi
           echo "✅ All prebuilt binaries are valid"
+
+  openwrt-build:
+    name: OpenWrt SDK compile (x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download & extract OpenWrt SDK
+        run: |
+          SDK_URL="https://downloads.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+          echo "Downloading SDK ..."
+          curl -fsSL "$SDK_URL" -o /tmp/sdk.tar.xz
+          echo "Extracting ..."
+          tar -xJf /tmp/sdk.tar.xz -C /tmp
+          SDK_DIR=$(ls -d /tmp/openwrt-sdk-* 2>/dev/null | head -1)
+          echo "SDK extracted to: $SDK_DIR"
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+
+      - name: Link package and verify info
+        run: |
+          SDK_DIR="${{ env.SDK_DIR }}"
+          ln -s "${{ github.workspace }}/openwrt-package" "$SDK_DIR/package/m3u8mc"
+          echo "✅ Package linked"
+          ls -la "$SDK_DIR/package/m3u8mc/Makefile"
+          cd "$SDK_DIR"
+          make package/m3u8mc/info V=s 2>&1 || {
+            echo "❌ make package/m3u8mc/info failed"
+            exit 1
+          }
+          echo "✅ Package recognized by build system"
+
+      - name: Compile ipk
+        run: |
+          SDK_DIR="${{ env.SDK_DIR }}"
+          cd "$SDK_DIR"
+          RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
+            make package/m3u8mc/compile V=s 2>&1 || {
+            echo "❌ Compilation failed"
+            exit 1
+          }
+          echo "✅ Compilation succeeded"
+          IPK_PATH=$(find "$SDK_DIR/bin" -name "*m3u8mc*.ipk" 2>/dev/null | head -1)
+          if [ -n "$IPK_PATH" ]; then
+            cp "$IPK_PATH" "${{ github.workspace }}/"
+            echo "✅ ipk: $(basename $IPK_PATH)"
+          fi
+          find "$SDK_DIR/bin" -name "*m3u8mc*.ipk" 2>/dev/null
+
+      - name: Upload ipk as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3u8mc-ipk-x86_64
+          path: "*.ipk"
+          if-no-files-found: ignore
