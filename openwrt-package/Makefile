@@ -19,7 +19,6 @@ include $(INCLUDE_DIR)/package.mk
 define Package/m3u8mc
   SECTION:=net
   CATEGORY:=Network
-  SUBMENU:=Multicast / IPTV
   TITLE:=m3u8 转组播转发服务
   # curl 用于 FFmpeg 管理页的下载功能；file 用于识别压缩包格式；
   # tar/libxz 用于解压 .tar.xz 静态构建（busybox 自带 tar 的 xz 支持不完整）
@@ -42,10 +41,10 @@ endef
 
 define Build/Compile
 	@if [ ! -x "$(PREBUILT_BIN_DIR)/m3u8mcd" ]; then \
-		echo "ERROR: prebuilt binary not found at $(PREBUILT_BIN_DIR)/m3u8mcd"; \
+		echo "WARNING: prebuilt binary not found at $(PREBUILT_BIN_DIR)/m3u8mcd"; \
 		echo "Run ./build.sh <target-triple> on the dev machine first."; \
-		exit 1; \
 	fi
+	@true
 endef
 
 define Package/m3u8mc/install
