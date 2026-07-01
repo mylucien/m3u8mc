@@ -205,17 +205,11 @@ jobs:
           make defconfig 2>&1
           echo "✅ Config generated, compiling..."
           RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
-            make package/m3u8mc/compile V=s 2>&1 || {
-            echo "❌ m3u8mc compilation failed"
+            make package/m3u8mc/compile package/luci-app-m3u8mc/compile V=s 2>&1 || {
+            echo "❌ compilation failed"
             exit 1
           }
-          echo "✅ m3u8mc compiled"
-          RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
-            make package/luci-app-m3u8mc/compile V=s 2>&1 || {
-            echo "❌ luci-app-m3u8mc compilation failed"
-            exit 1
-          }
-          echo "✅ luci-app-m3u8mc compiled"
+          echo "✅ All packages compiled"
           IPK_LIST=$(find "$SDK_DIR/bin" -name "*m3u8mc*.ipk" 2>/dev/null)
           echo "$IPK_LIST"
           for ipk in $IPK_LIST; do
