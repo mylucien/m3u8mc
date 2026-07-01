@@ -19,7 +19,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/m3u8mc
   SECTION:=net
   CATEGORY:=Network
-  SUBMENU:=IP Addresses and Names
+  SUBMENU:=Multicast / IPTV
   TITLE:=m3u8 转组播转发服务
   # curl 用于 FFmpeg 管理页的下载功能；file 用于识别压缩包格式；
   # tar/libxz 用于解压 .tar.xz 静态构建（busybox 自带 tar 的 xz 支持不完整）
@@ -31,7 +31,7 @@ define Package/m3u8mc/description
   Rust 实现的核心转发引擎 m3u8mcd + procd 服务管理 + 可选网络隔离（VLAN/防火墙）。
 endef
 
-define Package/m3u8mc-luci
+define Package/luci-app-m3u8mc
   SECTION:=luci
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
@@ -66,7 +66,7 @@ define Package/m3u8mc/install
 	    $(1)/usr/share/m3u8mc/ffmpeg-install.sh
 endef
 
-define Package/m3u8mc-luci/install
+define Package/luci-app-m3u8mc/install
 	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/controller
 	$(INSTALL_DATA) ./luci/controller/m3u8mc.lua \
 	    $(1)/usr/lib/lua/luci/controller/m3u8mc.lua
@@ -89,4 +89,4 @@ define Package/m3u8mc-luci/install
 endef
 
 $(eval $(call BuildPackage,m3u8mc))
-$(eval $(call BuildPackage,m3u8mc-luci))
+$(eval $(call BuildPackage,luci-app-m3u8mc))
