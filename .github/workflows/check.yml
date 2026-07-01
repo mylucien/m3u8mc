@@ -194,7 +194,8 @@ jobs:
         run: |
           SDK_DIR=/tmp/immortalwrt-sdk
           export TERM=linux
-          # 分别 link 两个独立包
+          # 分别 link 两个独立包（先清理缓存中可能的旧目录/链接）
+          rm -rf "$SDK_DIR/package/m3u8mc" "$SDK_DIR/package/luci-app-m3u8mc"
           ln -s "${{ github.workspace }}/m3u8mc/openwrt-package/m3u8mc" \
             "$SDK_DIR/package/m3u8mc"
           ln -s "${{ github.workspace }}/m3u8mc/openwrt-package/luci-app-m3u8mc" \
