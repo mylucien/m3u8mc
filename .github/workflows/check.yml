@@ -176,63 +176,24 @@ jobs:
         with:
           path: m3u8mc
 
-      - name: Clone ImmortalWrt source (for info check)
-        run: |
-          git clone --depth=1 --single-branch \
-            https://github.com/immortalwrt/immortalwrt.git \
-            /tmp/immortalwrt
-          echo "✅ ImmortalWrt: $(cd /tmp/immortalwrt && git log --oneline -1)"
-
-      - name: Link m3u8mc into ImmortalWrt
-        run: |
-          echo "=== Debug: check paths ==="
-          echo "workspace: ${{ github.workspace }}"
-          ls -la "${{ github.workspace }}/m3u8mc/" 2>/dev/null || echo "m3u8mc/ not found"
-          ls -la "${{ github.workspace }}/m3u8mc/openwrt-package/Makefile" 2>/dev/null || echo "Makefile not found under m3u8mc/"
-          ls -la "${{ github.workspace }}/openwrt-package/Makefile" 2>/dev/null || echo "Makefile not found at workspace root"
-          echo "=== Create symlink ==="
-          # Try to find the Makefile
-          PKG_DIR=""
-          if [ -f "${{ github.workspace }}/m3u8mc/openwrt-package/Makefile" ]; then
-            PKG_DIR="${{ github.workspace }}/m3u8mc/openwrt-package"
-          elif [ -f "${{ github.workspace }}/openwrt-package/Makefile" ]; then
-            PKG_DIR="${{ github.workspace }}/openwrt-package"
-          fi
-          echo "PKG_DIR=$PKG_DIR"
-          ln -s "$PKG_DIR" /tmp/immortalwrt/package/m3u8mc
-          ls -la /tmp/immortalwrt/package/m3u8mc/
-          ls -la /tmp/immortalwrt/package/m3u8mc/Makefile
-          echo "=== Makefile content (first 30 lines) ==="
-          head -30 /tmp/immortalwrt/package/m3u8mc/Makefile
-
-      - name: Verify package info (visible in menuconfig)
-        run: |
-          cd /tmp/immortalwrt
-          export TERM=linux
-          make defconfig 2>&1 || true
-          echo "=== Try package info target ==="
-          make --version
-          ls package/m3u8mc/Makefile 2>/dev/null && echo "Makefile exists in SDK" || echo "Makefile NOT found in SDK"
-          # Try multiple approaches
-          make package/m3u8mc/compile V=1 -n 2>&1 | head -20 || true
-          echo "=== Done ==="
-
-      - name: Download ImmortalWrt SDK (x86_64) for compilation
+      - name: Download ImmortalWrt SDK (x86_64)
         run: |
           SDK_URL="https://downloads.immortalwrt.org/releases/23.05.4/targets/x86/64/immortalwrt-sdk-23.05.4-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          echo "Downloading SDK from $SDK_URL ..."
+          echo "Downloading SDK ..."
           curl -fsSL "$SDK_URL" -o /tmp/sdk.tar.xz
           echo "Extracting ..."
           tar -xJf /tmp/sdk.tar.xz -C /tmp
           SDK_DIR=$(ls -d /tmp/immortalwrt-sdk-* 2>/dev/null | head -1)
           echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
-          echo "✅ SDK extracted: $SDK_DIR"
+          ls -la "$SDK_DIR"
 
-      - name: Compile ipk
+      - name: Link m3u8mc and compile ipk
         run: |
           SDK_DIR="${{ env.SDK_DIR }}"
           ln -s "${{ github.workspace }}/m3u8mc/openwrt-package" \
             "$SDK_DIR/package/m3u8mc"
+          ls -la "$SDK_DIR/package/m3u8mc/Makefile"
+          echo "✅ Package linked, starting compilation..."
           cd "$SDK_DIR"
           export TERM=linux
           RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
@@ -245,6 +206,7 @@ jobs:
           if [ -n "$IPK_PATH" ]; then
             cp "$IPK_PATH" "${{ github.workspace }}/"
             echo "✅ ipk: $(basename $IPK_PATH)"
+            ls -lh "${{ github.workspace }}"/*.ipk
           fi
 
       - name: Upload ipk as artifact
