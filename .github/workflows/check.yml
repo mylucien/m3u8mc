@@ -193,6 +193,8 @@ jobs:
       - name: Verify package info (visible in menuconfig)
         run: |
           cd /tmp/immortalwrt
+          export TERM=linux
+          make defconfig 2>&1 || true
           make package/m3u8mc/info V=s 2>&1 || {
             echo "❌ make package/m3u8mc/info failed"
             exit 1
@@ -216,6 +218,7 @@ jobs:
           ln -s "${{ github.workspace }}/m3u8mc/openwrt-package" \
             "$SDK_DIR/package/m3u8mc"
           cd "$SDK_DIR"
+          export TERM=linux
           RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
             make package/m3u8mc/compile V=s 2>&1 || {
             echo "❌ Compilation failed"
