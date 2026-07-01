@@ -18,6 +18,18 @@ s_global:option(Value, "http_port_base", translate("内部 HTTP 起始端口"),
     translate("各频道按此递增自动分配，范围 1024–65000"))
 s_global:option(Value, "control_socket", translate("控制 Socket 路径"))
 
+-- ffmpeg 下载地址（按架构）
+local ffmpeg_s = m:section(NamedSection, "global", "global", translate("FFmpeg 下载地址"))
+ffmpeg_s.addremove = false
+ffmpeg_s:option(Value, "ffmpeg_download_url_x86_64",  translate("x86_64 下载地址"))
+         :placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz")
+ffmpeg_s:option(Value, "ffmpeg_download_url_aarch64", translate("aarch64 下载地址"))
+         :placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz")
+ffmpeg_s:option(Value, "ffmpeg_download_url_armv7l",  translate("armv7l 下载地址"))
+         :placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-armhf-static.tar.xz")
+ffmpeg_s:option(Value, "ffmpeg_download_url_i686",    translate("i686 下载地址"))
+         :placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz")
+
 -- ── 频道列表 ────────────────────────────────────────────────
 local s = m:section(TypedSection, "channel", translate("频道列表"))
 s.template = "cbi/tblsection"

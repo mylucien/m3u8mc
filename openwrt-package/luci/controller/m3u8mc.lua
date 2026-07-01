@@ -139,15 +139,25 @@ local FFMPEG_SCRIPT   = "/usr/share/m3u8mc/ffmpeg-install.sh"
 local PROGRESS_FILE   = "/tmp/m3u8mc-ffmpeg-install.progress"
 local LOCK_FILE       = "/tmp/m3u8mc-ffmpeg-install.lock"
 
--- 按 CPU 架构推荐的默认下载地址（静态编译，无需 libc 依赖问题）。
+-- 默认 ffmpeg 静态构建下载地址（按 CPU 架构）。
 -- 来源：johnvansickle.com 的 ffmpeg 静态构建（长期维护，覆盖主流架构）。
 -- MIPS 系架构目前没有稳定的公开静态构建源，需用户手动提供 URL。
-local ARCH_DEFAULTS = {
-    ["x86_64"]  = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
-    ["aarch64"] = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz",
-    ["armv7l"]  = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-armhf-static.tar.xz",
-    ["i686"]    = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz",
+-- 可通过 UCI global 下的 ffmpeg_download_url_<arch> 覆盖（LuCI 全局设置页可配置）。
+local ARCH_DEFAULTS_RAW = {
+    x86_64  = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+    aarch64 = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz",
+    armv7l  = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-armhf-static.tar.xz",
+    i686    = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz",
 }
+
+--- 读取指定架构的 ffmpeg 下载地址：优先使用 UCI 配置值，其次内置默认值。
+local function get_download_url(arch, uci_cursor)
+    local uci_val = uci_cursor:get("m3u8mc", "global", "ffmpeg_download_url_" .. arch)
+    if uci_val and uci_val ~= "" then
+        return uci_val
+    end
+    return ARCH_DEFAULTS_RAW[arch] or ""
+end
 
 -- GET /admin/services/m3u8mc/api/ffmpeg_check
 -- 返回：当前生效 ffmpeg 的路径/版本/关键能力，以及按本机架构推荐的默认下载地址
@@ -164,7 +174,7 @@ function api_ffmpeg_check()
     )
 
     local arch = (sys.exec("uname -m 2>/dev/null") or ""):gsub("%s+$", "")
-    local default_url = ARCH_DEFAULTS[arch] or ""
+    local default_url = get_download_url(arch, uci)
 
     http.prepare_content("application/json")
     -- ffmpeg-install.sh check 本身已输出合法 JSON，这里拼接额外字段
