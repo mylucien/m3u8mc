@@ -1,4 +1,4 @@
-# 检验插件：验证 openwrt-package Makefile 和 Rust 源码
+# 检验插件：验证 m3u8mc Makefile 和 Rust 源码
 #
 # 每次 push / PR 自动运行（immortalwrt SDK 编译验证）：
 #   1. 检查 Makefile 格式（无注释在 define 块内等）
@@ -47,7 +47,7 @@ jobs:
       - name: Check for comments inside define blocks
         run: |
           errors=0
-          for mf in openwrt-package/m3u8mc/Makefile openwrt-package/luci-app-m3u8mc/Makefile; do
+          for mf in m3u8mc/Makefile luci-app-m3u8mc/Makefile; do
             echo "Checking $mf..."
             in_block=""
             while IFS= read -r line; do
@@ -73,7 +73,7 @@ jobs:
 
       - name: Verify required fields in Makefiles
         run: |
-          for mf in openwrt-package/m3u8mc/Makefile openwrt-package/luci-app-m3u8mc/Makefile; do
+          for mf in m3u8mc/Makefile luci-app-m3u8mc/Makefile; do
             echo "=== $mf ==="
             for field in SECTION CATEGORY TITLE; do
               if grep -q "^\s*${field}:=" "$mf"; then
@@ -103,20 +103,20 @@ jobs:
         run: |
           missing=0
           required_m3u8mc=(
-            "openwrt-package/m3u8mc/files/m3u8mc.init"
-            "openwrt-package/m3u8mc/files/m3u8mc.config"
-            "openwrt-package/m3u8mc/files/ffmpeg-install.sh"
+            "m3u8mc/files/m3u8mc.init"
+            "m3u8mc/files/m3u8mc.config"
+            "m3u8mc/files/ffmpeg-install.sh"
           )
           for f in "${required_m3u8mc[@]}"; do
             if [ -f "$f" ]; then echo "$f"; else echo "::error file=$f::missing"; missing=$((missing+1)); fi
           done
           required_luci=(
-            "openwrt-package/luci-app-m3u8mc/luci/controller/m3u8mc.lua"
-            "openwrt-package/luci-app-m3u8mc/luci/model/cbi/m3u8mc/channels.lua"
-            "openwrt-package/luci-app-m3u8mc/luci/model/cbi/m3u8mc/isolation.lua"
-            "openwrt-package/luci-app-m3u8mc/luci/view/m3u8mc/status.htm"
-            "openwrt-package/luci-app-m3u8mc/luci/view/m3u8mc/ffmpeg.htm"
-            "openwrt-package/luci-app-m3u8mc/luci/htdocs/m3u8mc-status.js"
+            "luci-app-m3u8mc/luci/controller/m3u8mc.lua"
+            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channels.lua"
+            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/isolation.lua"
+            "luci-app-m3u8mc/luci/view/m3u8mc/status.htm"
+            "luci-app-m3u8mc/luci/view/m3u8mc/ffmpeg.htm"
+            "luci-app-m3u8mc/luci/htdocs/m3u8mc-status.js"
           )
           for f in "${required_luci[@]}"; do
             if [ -f "$f" ]; then echo "$f"; else echo "::error file=$f::missing"; missing=$((missing+1)); fi
@@ -129,7 +129,7 @@ jobs:
     runs-on: ubuntu-22.04
     defaults:
       run:
-        working-directory: openwrt-package/m3u8mc
+        working-directory: m3u8mc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -196,9 +196,9 @@ jobs:
           export TERM=linux
           # 分别 link 两个独立包（先清理缓存中可能的旧目录/链接）
           rm -rf "$SDK_DIR/package/m3u8mc" "$SDK_DIR/package/luci-app-m3u8mc"
-          ln -s "${{ github.workspace }}/m3u8mc/openwrt-package/m3u8mc" \
+          ln -s "${{ github.workspace }}/m3u8mc/m3u8mc" \
             "$SDK_DIR/package/m3u8mc"
-          ln -s "${{ github.workspace }}/m3u8mc/openwrt-package/luci-app-m3u8mc" \
+          ln -s "${{ github.workspace }}/m3u8mc/luci-app-m3u8mc" \
             "$SDK_DIR/package/luci-app-m3u8mc"
           ls -la "$SDK_DIR/package/m3u8mc/Makefile"
           ls -la "$SDK_DIR/package/luci-app-m3u8mc/Makefile"
