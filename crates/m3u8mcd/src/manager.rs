@@ -82,7 +82,7 @@ impl ChannelManager {
         drop(channels);
 
         // 第二步：等待所有旧 handle 停止（不持有 lock）
-        for handle in to_stop {
+        for mut handle in to_stop {
             handle.stop_and_wait().await;
         }
 
@@ -122,7 +122,7 @@ impl ChannelManager {
             let mut channels = self.channels.write().await;
             channels.remove(name)
         };
-        if let Some(old) = old_handle {
+        if let Some(mut old) = old_handle {
             old.stop_and_wait().await;
         }
 
@@ -137,7 +137,7 @@ impl ChannelManager {
             channels.remove(name)
         };
         match handle {
-            Some(h) => {
+            Some(mut h) => {
                 h.stop_and_wait().await;
                 Ok(())
             }
@@ -156,7 +156,7 @@ impl ChannelManager {
             let mut channels = self.channels.write().await;
             channels.drain().map(|(_, h)| h).collect()
         };
-        for handle in handles {
+        for mut handle in handles {
             handle.stop_and_wait().await;
         }
     }
