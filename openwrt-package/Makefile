@@ -19,10 +19,11 @@ include $(INCLUDE_DIR)/package.mk
 define Package/m3u8mc
   SECTION:=net
   CATEGORY:=Network
+  SUBMENU:=Streaming
   TITLE:=m3u8 转组播转发服务
   # curl 用于 FFmpeg 管理页的下载功能；file 用于识别压缩包格式；
-  # tar/libxz 用于解压 .tar.xz 静态构建（busybox 自带 tar 的 xz 支持不完整）
-  DEPENDS:=+ffmpeg +curl +file +tar +libxz
+  # tar/liblzma 用于解压 .tar.xz 静态构建（busybox 自带 tar 的 xz 支持不完整）
+  DEPENDS:=+ffmpeg +curl +file +tar +liblzma
 endef
 
 define Package/m3u8mc/description
