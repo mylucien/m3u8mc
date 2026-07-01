@@ -44,7 +44,6 @@ jobs:
           - aarch64-unknown-linux-musl
           # tag 触发时额外编译以下架构
           - armv7-unknown-linux-musleabihf
-          - mipsel-unknown-linux-musl
           - i686-unknown-linux-musl
 
     steps:
@@ -139,7 +138,6 @@ jobs:
             | x86_64 | `x86_64-unknown-linux-musl` | x86 软路由 |
             | aarch64 | `aarch64-unknown-linux-musl` | IPQ807x / RK35xx |
             | armv7l | `armv7-unknown-linux-musleabihf` | 多数 ARM 路由器 |
-            | mipsel | `mipsel-unknown-linux-musl` | 老款 MIPS 路由器 |
             | i686 | `i686-unknown-linux-musl` | 旧 x86 设备 |
 
             **用法：**
