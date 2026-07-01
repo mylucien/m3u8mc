@@ -1,6 +1,6 @@
 # 检验插件：验证 openwrt-package Makefile 和 Rust 源码
 #
-# 每次 push / PR 自动运行：
+# 每次 push / PR 自动运行（immortalwrt SDK 编译验证）：
 #   1. 检查 Makefile 格式（无注释在 define 块内等）
 #   2. 检查必要文件齐全
 #   3. 运行 Rust 单元测试
