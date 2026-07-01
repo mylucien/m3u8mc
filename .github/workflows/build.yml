@@ -1,0 +1,155 @@
+# GitHub Actions：交叉编译 m3u8mcd / m3u8mcctl → bin/<target-triple>/
+#
+# 产物结构（与 openwrt-package/Makefile 的 PREBUILT_BIN_DIR 匹配）：
+#   bin/<target-triple>/
+#     ├── m3u8mcd
+#     └── m3u8mcctl
+#
+# 用法：
+#   1. git tag v0.1.0 并 push → 自动编译全部架构并发布到 Releases
+#   2. push 到 master → 仅编译 x86_64 + aarch64 快速验证
+#   3. 在 OpenWrt SDK 中：
+#        make package/m3u8mc/compile RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl
+#
+# 依赖：cargo-zigbuild（zig 链接器，静态 musl 编译）
+
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "编译目标（逗号分隔，为空则编译全部）"
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # push / PR 只编译主流架构
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          # tag 触发时额外编译以下架构
+          - armv7-unknown-linux-musleabihf
+          - mipsel-unknown-linux-musl
+          - i686-unknown-linux-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild
+
+      - name: Build for ${{ matrix.target }}
+        run: |
+            cargo zigbuild \
+              --target "${{ matrix.target }}" \
+              --profile release \
+              -p m3u8mcd \
+              -p m3u8mcctl
+
+      - name: Place binaries into bin/<target-triple>/
+        run: |
+          OUT_DIR="bin/${{ matrix.target }}"
+          mkdir -p "$OUT_DIR"
+          cp "target/${{ matrix.target }}/release/m3u8mcd"  "$OUT_DIR/m3u8mcd"
+          cp "target/${{ matrix.target }}/release/m3u8mcctl" "$OUT_DIR/m3u8mcctl"
+          strip "$OUT_DIR/m3u8mcd" "$OUT_DIR/m3u8mcctl" 2>/dev/null || true
+          echo "=== ${{ matrix.target }} ==="
+          ls -lh "$OUT_DIR/"
+          file "$OUT_DIR/"*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: bin/${{ matrix.target }}/
+          if-no-files-found: error
+
+  # ── 合并产物并发布 Release（仅 tag 触发） ─────────────────────
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout (for openwrt-package files)
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: download-artifacts
+
+      - name: Assemble release tarballs
+        run: |
+          # 每个架构单独打包，方便 OpenWrt Makefile 按 RUST_TARGET_TRIPLE 取用
+          for dir in download-artifacts/bin-*/; do
+            triple="${dir#download-artifacts/bin-}"
+            triple="${triple%/}"
+            tarball="m3u8mc-${triple}.tar.gz"
+            mkdir -p "dist/${triple}"
+            cp -r "$dir"/* "dist/${triple}/"
+            tar czf "$tarball" -C dist "${triple}"
+            echo "Packaged: $tarball"
+            ls -lh "$tarball"
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: m3u8mc ${{ github.ref_name }}
+          body: |
+            预编译二进制包，配合 OpenWrt `openwrt-package/Makefile` 使用。
+
+            **支持的架构：**
+
+            | 架构 | Rust triple | 适用设备 |
+            |---|---|---|
+            | x86_64 | `x86_64-unknown-linux-musl` | x86 软路由 |
+            | aarch64 | `aarch64-unknown-linux-musl` | IPQ807x / RK35xx |
+            | armv7l | `armv7-unknown-linux-musleabihf` | 多数 ARM 路由器 |
+            | mipsel | `mipsel-unknown-linux-musl` | 老款 MIPS 路由器 |
+            | i686 | `i686-unknown-linux-musl` | 旧 x86 设备 |
+
+            **用法：**
+            ```bash
+            # 下载对应架构的压缩包，解压到 repo 的 bin/ 目录
+            tar xzf m3u8mc-x86_64-unknown-linux-musl.tar.gz
+            # 然后在 OpenWrt SDK 中编译 ipk
+            RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl make package/m3u8mc/compile V=s
+            ```
+          files: |
+            m3u8mc-*.tar.gz
+          draft: false
+          prerelease: false
