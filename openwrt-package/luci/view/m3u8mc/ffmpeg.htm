@@ -1,0 +1,244 @@
+<%+header%>
+
+<style>
+#mc-ffmpeg-wrap { max-width: 760px; }
+.mc-ff-card {
+  border: 1px solid #ddd; border-radius: 4px; padding: 12px 16px;
+  margin-bottom: 14px; background: #fafafa;
+}
+.mc-ff-card h3 { margin-top: 0; font-size: 1.05em; }
+.mc-ff-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.mc-ff-label { width: 120px; color: #555; flex-shrink: 0; }
+.mc-ff-val { font-family: monospace; }
+.mc-feat {
+  display: inline-block; border-radius: 3px; padding: 1px 6px;
+  font-size: 0.82em; font-weight: 600; margin-right: 4px;
+}
+.mc-feat-ok   { background: #d4edda; color: #155724; }
+.mc-feat-miss { background: #f8d7da; color: #721c24; }
+#mc-ff-url {
+  width: 100%; max-width: 560px; font-family: monospace; font-size: 0.9em;
+  padding: 4px 6px;
+}
+#mc-ff-progress-wrap {
+  display: none; margin-top: 10px;
+}
+#mc-ff-progress-bar-outer {
+  background: #eee; border-radius: 3px; height: 16px; overflow: hidden;
+  max-width: 560px;
+}
+#mc-ff-progress-bar-inner {
+  background: #4a90d9; height: 100%; width: 0%;
+  transition: width 0.3s ease;
+}
+#mc-ff-progress-msg { font-size: 0.85em; color: #555; margin-top: 4px; }
+#mc-ff-err { color: #721c24; font-size: 0.88em; margin-top: 6px; display:none; }
+.mc-ff-hint { color: #888; font-size: 0.85em; margin-top: 4px; }
+</style>
+
+<h2><%:FFmpeg 管理%></h2>
+<p class="mc-ff-hint">
+  <%:OpenWrt 官方源里的 ffmpeg 包通常为精简编译（缺少 h264 比特流过滤器、部分 muxer/协议支持），
+  转组播场景建议使用全功能静态编译版本。可点击下方按钮自动下载安装，或手动填写地址。%>
+</p>
+
+<div id="mc-ffmpeg-wrap">
+
+  <div class="mc-ff-card">
+    <h3><%:当前状态%></h3>
+    <div class="mc-ff-row">
+      <span class="mc-ff-label"><%:可执行文件%></span>
+      <span class="mc-ff-val" id="mc-ff-path">—</span>
+    </div>
+    <div class="mc-ff-row">
+      <span class="mc-ff-label"><%:版本%></span>
+      <span class="mc-ff-val" id="mc-ff-version">—</span>
+    </div>
+    <div class="mc-ff-row">
+      <span class="mc-ff-label"><%:关键能力%></span>
+      <span id="mc-ff-features">—</span>
+    </div>
+    <div class="mc-ff-row">
+      <span class="mc-ff-label"><%:自定义路径%></span>
+      <span class="mc-ff-val" id="mc-ff-custom">（<%:未设置，使用系统 PATH%>）</span>
+    </div>
+  </div>
+
+  <div class="mc-ff-card">
+    <h3><%:下载安装%></h3>
+    <div class="mc-ff-row">
+      <span class="mc-ff-label"><%:下载地址%></span>
+      <input type="text" id="mc-ff-url" placeholder="https://.../ffmpeg-release-xxx-static.tar.xz">
+    </div>
+    <p class="mc-ff-hint" id="mc-ff-arch-hint"></p>
+    <div class="mc-ff-row">
+      <button class="btn cbi-button cbi-button-apply" id="mc-ff-install-btn">
+        <%:下载并安装%>
+      </button>
+      <button class="btn cbi-button cbi-button-reset" id="mc-ff-reset-btn">
+        <%:恢复默认（使用系统 ffmpeg）%>
+      </button>
+    </div>
+
+    <div id="mc-ff-progress-wrap">
+      <div id="mc-ff-progress-bar-outer">
+        <div id="mc-ff-progress-bar-inner"></div>
+      </div>
+      <div id="mc-ff-progress-msg"></div>
+    </div>
+    <div id="mc-ff-err"></div>
+
+    <p class="mc-ff-hint">
+      <%:支持 tar.xz / tar.gz / tar.bz2 压缩包（自动解压提取 ffmpeg 二进制）或裸二进制文件直链。
+      安装成功后会自动写入配置并热重载，无需重启插件。%>
+    </p>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  var elPath    = document.getElementById('mc-ff-path');
+  var elVersion = document.getElementById('mc-ff-version');
+  var elFeat    = document.getElementById('mc-ff-features');
+  var elCustom  = document.getElementById('mc-ff-custom');
+  var elUrl     = document.getElementById('mc-ff-url');
+  var elArchHint= document.getElementById('mc-ff-arch-hint');
+  var elInstallBtn = document.getElementById('mc-ff-install-btn');
+  var elResetBtn   = document.getElementById('mc-ff-reset-btn');
+  var elProgWrap = document.getElementById('mc-ff-progress-wrap');
+  var elProgBar  = document.getElementById('mc-ff-progress-bar-inner');
+  var elProgMsg  = document.getElementById('mc-ff-progress-msg');
+  var elErr      = document.getElementById('mc-ff-err');
+
+  var progressTimer = null;
+
+  function xhr(url, body, cb) {
+    var req = new XMLHttpRequest();
+    req.open(body ? 'POST' : 'GET', url, true);
+    if (body) req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    req.onreadystatechange = function () {
+      if (req.readyState !== 4) return;
+      if (req.status === 200) {
+        try { cb(null, JSON.parse(req.responseText)); }
+        catch (e) { cb('响应解析失败'); }
+      } else {
+        cb('HTTP ' + req.status);
+      }
+    };
+    req.send(body || null);
+  }
+
+  function showErr(msg) {
+    if (msg) { elErr.textContent = msg; elErr.style.display = ''; }
+    else      { elErr.textContent = '';  elErr.style.display = 'none'; }
+  }
+
+  function featPill(ok, label) {
+    return '<span class="mc-feat ' + (ok ? 'mc-feat-ok' : 'mc-feat-miss') + '">' +
+      label + (ok ? ' ✓' : ' ✗') + '</span>';
+  }
+
+  function refreshCheck() {
+    xhr('<%=luci.dispatcher.build_url("admin","services","m3u8mc","api","ffmpeg_check")%>', null, function (err, data) {
+      if (err) { showErr('检测失败：' + err); return; }
+      if (data.error) { showErr(data.error); }
+
+      elPath.textContent    = data.found ? data.path : '未找到';
+      elVersion.textContent = data.found ? data.version : '—';
+
+      if (data.found && data.features) {
+        elFeat.innerHTML =
+          featPill(data.features.mpegts, 'mpegts') +
+          featPill(data.features.rtp, 'rtp') +
+          featPill(data.features.h264_mp4toannexb, 'h264_bsf') +
+          featPill(data.features.hls_demux, 'hls');
+      } else {
+        elFeat.textContent = '—';
+      }
+
+      elCustom.textContent = data.custom_bin && data.custom_bin !== ''
+        ? data.custom_bin
+        : '（未设置，使用系统 PATH）';
+
+      if (data.default_url && data.default_url !== '') {
+        elArchHint.textContent = '检测到架构 ' + data.arch + '，推荐地址已自动填入（可修改）';
+        if (!elUrl.value) elUrl.value = data.default_url;
+      } else {
+        elArchHint.textContent = '未找到 ' + (data.arch || '当前架构') +
+          ' 的推荐静态构建地址，请手动填写下载 URL（如自行编译的 ffmpeg 二进制直链）';
+      }
+    });
+  }
+
+  function startInstall() {
+    var url = elUrl.value.trim();
+    if (!url) { showErr('请填写下载地址'); return; }
+    showErr(null);
+
+    elInstallBtn.disabled = true;
+    elProgWrap.style.display = '';
+    elProgBar.style.width = '0%';
+    elProgMsg.textContent = '提交任务中…';
+
+    var fd = 'url=' + encodeURIComponent(url);
+    xhr('<%=luci.dispatcher.build_url("admin","services","m3u8mc","api","ffmpeg_install")%>', fd, function (err, data) {
+      if (err || (data && data.error)) {
+        showErr(err || data.error);
+        elInstallBtn.disabled = false;
+        elProgWrap.style.display = 'none';
+        return;
+      }
+      pollProgress();
+    });
+  }
+
+  function pollProgress() {
+    if (progressTimer) clearInterval(progressTimer);
+    progressTimer = setInterval(function () {
+      xhr('<%=luci.dispatcher.build_url("admin","services","m3u8mc","api","ffmpeg_progress")%>', null, function (err, data) {
+        if (err) return; // 短暂失败不打断轮询
+        if (data.error) {
+          showErr(data.error);
+          clearInterval(progressTimer);
+          elInstallBtn.disabled = false;
+          return;
+        }
+        if (typeof data.progress === 'number') {
+          elProgBar.style.width = data.progress + '%';
+        }
+        if (data.msg) elProgMsg.textContent = data.msg;
+
+        if (data.done || (!data.running && data.progress >= 100)) {
+          clearInterval(progressTimer);
+          elInstallBtn.disabled = false;
+          elProgMsg.textContent = (data.msg || '安装完成') + '（已生效）';
+          setTimeout(refreshCheck, 500);
+        } else if (!data.running && !data.done) {
+          // 后台任务已结束但既未报错也未标记完成：大概率是异常退出
+          clearInterval(progressTimer);
+          elInstallBtn.disabled = false;
+          if (!data.msg) elProgMsg.textContent = '任务已结束，状态未知，请检查日志';
+        }
+      });
+    }, 1200);
+  }
+
+  function resetFfmpeg() {
+    if (!confirm('确认恢复使用系统 PATH 中的 ffmpeg？')) return;
+    elResetBtn.disabled = true;
+    xhr('<%=luci.dispatcher.build_url("admin","services","m3u8mc","api","ffmpeg_reset")%>', 'reset=1', function (err, data) {
+      elResetBtn.disabled = false;
+      if (err || (data && data.error)) { showErr(err || data.error); return; }
+      refreshCheck();
+    });
+  }
+
+  elInstallBtn.addEventListener('click', startInstall);
+  elResetBtn.addEventListener('click', resetFfmpeg);
+
+  refreshCheck();
+})();
+</script>
+
+<%+footer%>

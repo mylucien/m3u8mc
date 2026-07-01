@@ -1,0 +1,239 @@
+//! Poller（设计文档 1.2 / 1.7）。
+//!
+//! - 启动时做二级播放列表解析（master → 按带宽选最优 variant → 替换各镜像 host）；
+//! - 此后按 `target_duration/2` 轮询 media url，用全局 media sequence 去重；
+//! - 检测 sequence 异常回退（上游重启）并重置追踪基线；
+//! - media url 连续失败达到阈值后判定 token 失效，触发重新解析 master playlist。
+
+use super::downloader::{Downloader, SegmentTask};
+use super::m3u8::{self, ParsedPlaylist};
+use super::mirror_pool::MirrorPool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::watch;
+use url::Url;
+
+const MEDIA_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const TOKEN_INVALID_THRESHOLD: u32 = 5;
+/// sequence 回退超过该幅度才判定为"上游服务器重启"，而非普通抖动
+const SEQUENCE_ROLLBACK_THRESHOLD: u64 = 50;
+
+pub struct Poller {
+    client: reqwest::Client,
+    mirror_pool: Arc<MirrorPool>,
+    downloader: Arc<Downloader>,
+    /// 配置里的原始镜像 url 列表（master/media playlist 地址，每个镜像一条）
+    origin_urls: Vec<String>,
+    /// 解析出的各镜像 media playlist 完整地址，按 origin_urls 顺序对应
+    media_urls: Mutex<Vec<String>>,
+    last_target_duration: Mutex<f32>,
+    last_max_global_seq: AtomicU64,
+    has_baseline: AtomicBool,
+}
+
+impl Poller {
+    pub fn new(
+        mirror_pool: Arc<MirrorPool>,
+        downloader: Arc<Downloader>,
+        origin_urls: Vec<String>,
+    ) -> Arc<Self> {
+        Arc::new(Poller {
+            client: reqwest::Client::builder()
+                .timeout(MEDIA_FETCH_TIMEOUT)
+                .build()
+                .expect("failed to build reqwest client"),
+            mirror_pool,
+            downloader,
+            origin_urls,
+            media_urls: Mutex::new(Vec::new()),
+            last_target_duration: Mutex::new(6.0),
+            last_max_global_seq: AtomicU64::new(0),
+            has_baseline: AtomicBool::new(false),
+        })
+    }
+
+    async fn fetch_text(&self, url: &str) -> anyhow::Result<String> {
+        let resp = self.client.get(url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("playlist fetch failed: {}", resp.status());
+        }
+        Ok(resp.text().await?)
+    }
+
+    /// 二级播放列表解析：返回每个镜像 media playlist 所在目录的 base url
+    /// （MirrorPool 的 server 标识，与 Downloader::build_url 拼接逻辑对应），
+    /// 同时把各镜像的 media playlist 完整地址记入 self.media_urls。
+    async fn resolve_master(&self) -> anyhow::Result<Vec<String>> {
+        let first_url = self
+            .origin_urls
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("channel has no configured urls"))?;
+
+        let text = self.fetch_text(first_url).await?;
+        let parsed = m3u8::parse(&text);
+
+        let variant_path: Option<String> = match parsed {
+            ParsedPlaylist::Master(variants) => {
+                let best = m3u8::pick_best_variant(&variants)
+                    .ok_or_else(|| anyhow::anyhow!("master playlist has no variants"))?;
+                Some(best.uri.clone())
+            }
+            ParsedPlaylist::Media(_) => None, // 单级列表，master 本身即 media playlist
+        };
+
+        let mut media_urls = Vec::with_capacity(self.origin_urls.len());
+        let mut bases = Vec::with_capacity(self.origin_urls.len());
+        for origin in &self.origin_urls {
+            let media_url = match &variant_path {
+                Some(path) => {
+                    let base = Url::parse(origin)?;
+                    base.join(path)?.to_string()
+                }
+                None => origin.clone(),
+            };
+            let dir = media_url
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_string())
+                .unwrap_or_else(|| media_url.clone());
+            bases.push(dir);
+            media_urls.push(media_url);
+        }
+
+        *self.media_urls.lock().unwrap() = media_urls;
+        Ok(bases)
+    }
+
+    /// 拉取一次 media playlist：依次尝试已记录的各镜像 media url，任一成功即返回。
+    async fn fetch_media_playlist(&self) -> anyhow::Result<m3u8::MediaPlaylist> {
+        let urls = self.media_urls.lock().unwrap().clone();
+        let mut last_err = anyhow::anyhow!("no media urls resolved yet");
+        for url in &urls {
+            match self.fetch_text(url).await {
+                Ok(text) => match m3u8::parse(&text) {
+                    ParsedPlaylist::Media(m) => return Ok(m),
+                    ParsedPlaylist::Master(_) => {
+                        anyhow::bail!("media url unexpectedly returned a master playlist (token/redirect changed?)")
+                    }
+                },
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
+    /// 主循环：在 channel 任务里 `tokio::spawn` 运行，直到 stop_rx 收到关闭信号。
+    pub async fn run(self: Arc<Self>, mut stop_rx: watch::Receiver<bool>) {
+        // 初始解析，失败则退避重试，不让整个频道任务直接退出
+        loop {
+            match self.resolve_master().await {
+                Ok(bases) => {
+                    self.reinit_mirror_pool(bases);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to resolve master playlist, retrying in 5s");
+                    if wait_or_stop(&mut stop_rx, Duration::from_secs(5)).await {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let mut consecutive_failures: u32 = 0;
+
+        loop {
+            match self.fetch_media_playlist().await {
+                Ok(playlist) => {
+                    consecutive_failures = 0;
+                    *self.last_target_duration.lock().unwrap() = playlist.target_duration;
+                    self.process_playlist(playlist);
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    tracing::warn!(error = %e, consecutive_failures, "media playlist fetch failed");
+                    if consecutive_failures >= TOKEN_INVALID_THRESHOLD {
+                        tracing::warn!("media url repeatedly failing, treating as token expiry, re-resolving master playlist");
+                        match self.resolve_master().await {
+                            Ok(bases) => {
+                                self.reinit_mirror_pool(bases);
+                                consecutive_failures = 0;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "re-resolving master playlist also failed");
+                            }
+                        }
+                    }
+                }
+            }
+
+            let poll_interval = (*self.last_target_duration.lock().unwrap() / 2.0).max(0.5);
+            if wait_or_stop(&mut stop_rx, Duration::from_secs_f32(poll_interval)).await {
+                return;
+            }
+        }
+    }
+
+    /// MirrorPool 的 server 列表在 master 重新解析后可能变化（极少见，host 不会变但保留扩展性），
+    /// 当前实现里 MirrorPool 在 channel 启动时一次性创建，这里仅做日志提示；
+    /// 如需热替换 server 列表，可在 MirrorPool 上扩展 `replace_servers` 方法。
+    fn reinit_mirror_pool(&self, bases: Vec<String>) {
+        tracing::info!(?bases, "resolved media playlist bases");
+        self.mirror_pool.replace_servers(bases);
+    }
+
+    fn process_playlist(&self, playlist: m3u8::MediaPlaylist) {
+        let base_seq = playlist.media_sequence;
+        let current_max = base_seq + playlist.segments.len() as u64;
+
+        let has_baseline = self.has_baseline.load(Ordering::Relaxed);
+        let last_max = self.last_max_global_seq.load(Ordering::Relaxed);
+
+        if has_baseline && base_seq + SEQUENCE_ROLLBACK_THRESHOLD < last_max {
+            tracing::warn!(
+                old_max = last_max,
+                new_base = base_seq,
+                "media sequence rolled back sharply, assuming upstream server restarted; resetting baseline"
+            );
+            self.has_baseline.store(false, Ordering::Relaxed);
+        } else if has_baseline && base_seq < last_max {
+            tracing::warn!(
+                old_max = last_max,
+                new_base = base_seq,
+                rollback = last_max - base_seq,
+                "media sequence partially rolled back (below threshold), new segments may be skipped until sequence catches up"
+            );
+        }
+
+        let has_baseline = self.has_baseline.load(Ordering::Relaxed);
+        let start_from = if has_baseline { last_max } else { base_seq };
+
+        let mut new_tasks = Vec::new();
+        for (i, seg) in playlist.segments.iter().enumerate() {
+            let global_seq = base_seq + i as u64;
+            if global_seq < start_from {
+                continue;
+            }
+            new_tasks.push(SegmentTask {
+                key: format!("{global_seq}:{}", seg.uri),
+                rel_path: seg.uri.clone(),
+                duration_secs: seg.duration_secs,
+            });
+        }
+
+        if !new_tasks.is_empty() {
+            self.downloader.submit(new_tasks);
+        }
+
+        self.last_max_global_seq.store(current_max, Ordering::Relaxed);
+        self.has_baseline.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 等待 duration 或直到收到停止信号；返回 true 表示应当停止。
+async fn wait_or_stop(stop_rx: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => false,
+        _ = stop_rx.changed() => true,
+    }
+}

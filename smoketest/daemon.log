@@ -1,0 +1,18 @@
+[2m2026-06-30T11:57:58.678626Z[0m [32m INFO[0m [2mm3u8mcd[0m[2m:[0m loaded configuration [3mchannels[0m[2m=[0m1
+[2m2026-06-30T11:57:58.678739Z[0m [32m INFO[0m [2mm3u8mcd::manager[0m[2m:[0m starting channel [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:57:58.680654Z[0m [32m INFO[0m [2mm3u8mcd::channel::http_server[0m[2m:[0m internal http server listening [3maddr[0m[2m=[0m127.0.0.1:28080 [3mplaylist_route[0m[2m=[0m/live/playlist.m3u8
+[2m2026-06-30T11:57:58.681368Z[0m [32m INFO[0m [2mm3u8mcd::control[0m[2m:[0m control socket listening [3msocket_path[0m[2m=[0m"/home/claude/m3u8mc/smoketest/m3u8mcd.sock"
+[2m2026-06-30T11:57:58.690650Z[0m [32m INFO[0m [2mm3u8mcd::channel::poller[0m[2m:[0m resolved media playlist bases [3mbases[0m[2m=[0m["http://127.0.0.1:19999"]
+[2m2026-06-30T11:57:59.185902Z[0m [32m INFO[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg started [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:09.284958Z[0m [34mDEBUG[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg: [hls @ 0x55f95e164180] Error when loading first segment 'http://127.0.0.1:28080/live/seg/0.ts' [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:09.285040Z[0m [34mDEBUG[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg: [in#0 @ 0x55f95e164080] Error opening input: Invalid data found when processing input [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:09.285059Z[0m [33m WARN[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg fatal keyword matched: [in#0 @ 0x55f95e164080] Error opening input: Invalid data found when processing input [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:09.287669Z[0m [33m WARN[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg stopped, restarting after delay [3mchannel[0m[2m=[0msmoke1 [3mreason[0m[2m=[0m"log-stream-ended"
+[2m2026-06-30T11:58:11.296417Z[0m [32m INFO[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg started [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:13.694035Z[0m [32m INFO[0m [2mm3u8mcd::manager[0m[2m:[0m reload: config diff computed [3madded[0m[2m=[0m0 [3mremoved[0m[2m=[0m0 [3mchanged[0m[2m=[0m0 [3munchanged[0m[2m=[0m1
+[2m2026-06-30T11:58:21.392816Z[0m [34mDEBUG[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg: [hls @ 0x5616c50c0180] Error when loading first segment 'http://127.0.0.1:28080/live/seg/0.ts' [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:21.392881Z[0m [34mDEBUG[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg: [in#0 @ 0x5616c50c0080] Error opening input: Invalid data found when processing input [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:21.392890Z[0m [33m WARN[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg fatal keyword matched: [in#0 @ 0x5616c50c0080] Error opening input: Invalid data found when processing input [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:21.393926Z[0m [33m WARN[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg stopped, restarting after delay [3mchannel[0m[2m=[0msmoke1 [3mreason[0m[2m=[0m"log-stream-ended"
+[2m2026-06-30T11:58:23.400425Z[0m [32m INFO[0m [2mm3u8mcd::channel::ffmpeg_supervisor[0m[2m:[0m ffmpeg started [3mchannel[0m[2m=[0msmoke1
+[2m2026-06-30T11:58:23.487682Z[0m [32m INFO[0m [2mm3u8mcd[0m[2m:[0m shutdown signal received, exiting

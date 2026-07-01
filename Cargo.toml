@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/m3u8mcd",
+    "crates/m3u8mcctl",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

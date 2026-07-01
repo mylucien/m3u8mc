@@ -1,0 +1,329 @@
+//! Downloader Pool（设计文档 1.8）。
+//!
+//! 标准模式：单分片按"HEAD探测可分块性→多Range并发→失败回退整体下载→
+//! 同服务器重试耗尽换台"流程下载（1.8.2）。
+//! 赛马模式：并发对所有候选节点发起整体下载，取第一个成功结果（1.8.3）。
+
+use super::cache::SegmentCache;
+use super::mirror_pool::MirrorPool;
+use bytes::{Bytes, BytesMut};
+use dashmap::DashSet;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+
+const RETRY_PER_SERVER: u32 = 2;
+const READ_STALL_TIMEOUT: Duration = Duration::from_secs(8);
+const HEAD_TIMEOUT: Duration = Duration::from_secs(4);
+const WHOLE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadStrategy {
+    RoundRobin,
+    Race,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentTask {
+    /// 用于跨轮次去重的 key（通常是分片在媒体列表内的相对路径）
+    pub key: String,
+    /// 相对路径（拼到各镜像服务器 base url 后即为完整下载地址）
+    pub rel_path: String,
+    pub duration_secs: f32,
+}
+
+/// 软上限背压（1.8.4）：进行中任务数超过该阈值时，丢弃本轮多余的新分片提交
+const MAX_INFLIGHT_SOFT_LIMIT: usize = 64;
+
+pub struct Downloader {
+    client: reqwest::Client,
+    mirror_pool: Arc<MirrorPool>,
+    cache: Arc<SegmentCache>,
+    semaphore: Arc<Semaphore>,
+    in_progress: Arc<DashSet<String>>,
+    strategy: DownloadStrategy,
+    threads: usize,
+    race_ips: Vec<String>,
+    race_host: Option<String>,
+    overloaded: std::sync::atomic::AtomicBool,
+}
+
+impl Downloader {
+    pub fn new(
+        mirror_pool: Arc<MirrorPool>,
+        cache: Arc<SegmentCache>,
+        strategy: DownloadStrategy,
+        threads: usize,
+        race_ips: Vec<String>,
+        race_host: Option<String>,
+    ) -> Arc<Self> {
+        let n_servers = mirror_pool.server_count().max(1);
+        let permits = (n_servers * 3).max(6);
+        let client = reqwest::Client::builder()
+            .timeout(WHOLE_DOWNLOAD_TIMEOUT)
+            .build()
+            .expect("failed to build reqwest client");
+        Arc::new(Downloader {
+            client,
+            mirror_pool,
+            cache,
+            semaphore: Arc::new(Semaphore::new(permits)),
+            in_progress: Arc::new(DashSet::new()),
+            strategy,
+            threads: threads.max(1),
+            race_ips,
+            race_host,
+            overloaded: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub fn is_overloaded(&self) -> bool {
+        self.overloaded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 提交一批新发现的分片任务（1.8.1）。
+    pub fn submit(self: &Arc<Self>, tasks: Vec<SegmentTask>) {
+        let inflight = self.in_progress.len();
+        let mut tasks = tasks;
+        if inflight > MAX_INFLIGHT_SOFT_LIMIT {
+            self.overloaded.store(true, std::sync::atomic::Ordering::Relaxed);
+            let keep = tasks.len().min(4);
+            tracing::warn!(
+                inflight,
+                dropped = tasks.len().saturating_sub(keep),
+                "downloader overloaded, dropping older pending segments in this batch"
+            );
+            tasks = tasks.split_off(tasks.len() - keep);
+        } else {
+            self.overloaded.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        for task in tasks {
+            if !self.in_progress.insert(task.key.clone()) {
+                continue; // 已在下载中，跳过（去重）
+            }
+            let this = Arc::clone(self);
+            let seq = this.cache.alloc_seq();
+            tokio::spawn(async move {
+                let _permit = this.semaphore.acquire().await;
+                let result = match this.strategy {
+                    DownloadStrategy::RoundRobin => this.download_round_robin(&task).await,
+                    DownloadStrategy::Race => this.download_race(&task).await,
+                };
+                match result {
+                    Ok(data) => {
+                        this.cache.insert(seq, data, task.duration_secs);
+                    }
+                    Err(e) => {
+                        tracing::warn!(rel_path = %task.rel_path, error = %e, "segment download failed on all candidates");
+                    }
+                }
+                this.in_progress.remove(&task.key);
+            });
+        }
+    }
+
+    fn build_url(server_base: &str, rel_path: &str) -> String {
+        let base = server_base.trim_end_matches('/');
+        let rel = rel_path.trim_start_matches('/');
+        format!("{base}/{rel}")
+    }
+
+    /// 1.8.2 标准模式单分片下载决策流程
+    async fn download_round_robin(&self, task: &SegmentTask) -> anyhow::Result<Bytes> {
+        let primary = self
+            .mirror_pool
+            .next_server()
+            .ok_or_else(|| anyhow::anyhow!("no mirror server available"))?;
+        let mut candidates = vec![primary.clone()];
+        for s in self.mirror_pool.available_servers() {
+            if s != primary {
+                candidates.push(s);
+            }
+        }
+
+        let mut last_err = anyhow::anyhow!("no candidates");
+        for server in candidates {
+            let url = Self::build_url(&server, &task.rel_path);
+            match self.download_from_server(&url, self.threads).await {
+                Ok(data) => {
+                    self.mirror_pool.report_success(&server);
+                    return Ok(data);
+                }
+                Err(e) => {
+                    last_err = e;
+                    self.mirror_pool.report_task_failed(&server);
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// 单台服务器：HEAD 探测 → 按需多线程分块 → 失败回退整体下载（含重试）
+    async fn download_from_server(&self, url: &str, threads: usize) -> anyhow::Result<Bytes> {
+        if threads > 1 {
+            if let Some(size) = self.probe_size(url).await {
+                match self.download_ranged(url, size, threads).await {
+                    Ok(data) => return Ok(data),
+                    Err(e) => {
+                        tracing::debug!(url, error = %e, "ranged download failed, falling back to whole download");
+                    }
+                }
+            }
+        }
+        self.download_whole_with_retry(url, None).await
+    }
+
+    async fn probe_size(&self, url: &str) -> Option<u64> {
+        let resp = tokio::time::timeout(HEAD_TIMEOUT, self.client.head(url).send())
+            .await
+            .ok()?
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let accepts_ranges = resp
+            .headers()
+            .get(reqwest::header::ACCEPT_RANGES)
+            .map(|v| v.as_bytes() == b"bytes")
+            .unwrap_or(false);
+        if !accepts_ranges {
+            return None;
+        }
+        resp.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    }
+
+    async fn download_ranged(&self, url: &str, size: u64, threads: usize) -> anyhow::Result<Bytes> {
+        let chunk = (size + threads as u64 - 1) / threads as u64;
+        let mut futs = FuturesUnordered::new();
+        for i in 0..threads {
+            let start = i as u64 * chunk;
+            if start >= size {
+                break;
+            }
+            let end = ((start + chunk).min(size)) - 1;
+            let url = url.to_string();
+            let client = self.client.clone();
+            futs.push(async move {
+                let range = format!("bytes={start}-{end}");
+                let resp = tokio::time::timeout(
+                    WHOLE_DOWNLOAD_TIMEOUT,
+                    client.get(&url).header(reqwest::header::RANGE, range).send(),
+                )
+                .await??;
+                if !resp.status().is_success() {
+                    anyhow::bail!("range request failed: {}", resp.status());
+                }
+                let bytes = resp.bytes().await?;
+                Ok::<(u64, Bytes), anyhow::Error>((start, bytes))
+            });
+        }
+
+        let mut parts: Vec<(u64, Bytes)> = Vec::new();
+        while let Some(res) = futs.next().await {
+            parts.push(res?); // 任一分块失败即整体判定失败（不做缺块补传）
+        }
+        parts.sort_by_key(|(start, _)| *start);
+        let mut buf = BytesMut::with_capacity(size as usize);
+        for (_, b) in parts {
+            buf.extend_from_slice(&b);
+        }
+        Ok(buf.freeze())
+    }
+
+    async fn download_whole_with_retry(&self, url: &str, host_override: Option<&str>) -> anyhow::Result<Bytes> {
+        let mut last_err = anyhow::anyhow!("unreachable");
+        for attempt in 0..=RETRY_PER_SERVER {
+            match self.download_whole_once(url, host_override).await {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    last_err = e;
+                    if attempt < RETRY_PER_SERVER {
+                        tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn download_whole_once(&self, url: &str, host_override: Option<&str>) -> anyhow::Result<Bytes> {
+        let mut req = self.client.get(url);
+        if let Some(host) = host_override {
+            req = req.header(reqwest::header::HOST, host.to_string());
+        }
+        let resp = tokio::time::timeout(READ_STALL_TIMEOUT, req.send()).await??;
+        if !resp.status().is_success() {
+            anyhow::bail!("download failed: {}", resp.status());
+        }
+        let bytes = tokio::time::timeout(WHOLE_DOWNLOAD_TIMEOUT, resp.bytes()).await??;
+        Ok(bytes)
+    }
+
+    /// 1.8.3 赛马模式：并发对所有候选节点发起整体下载请求，取第一个成功结果。
+    async fn download_race(&self, task: &SegmentTask) -> anyhow::Result<Bytes> {
+        let mut candidates: Vec<(String, Option<String>)> = self
+            .mirror_pool
+            .available_servers()
+            .into_iter()
+            .map(|s| (s, None))
+            .collect();
+        for ip in &self.race_ips {
+            let base = if ip.starts_with("http://") || ip.starts_with("https://") {
+                ip.clone()
+            } else {
+                format!("http://{ip}")
+            };
+            candidates.push((base, self.race_host.clone()));
+        }
+
+        if candidates.is_empty() {
+            anyhow::bail!("no race candidates available");
+        }
+
+        let mut futs = FuturesUnordered::new();
+        for (server, host_override) in &candidates {
+            let url = Self::build_url(server, &task.rel_path);
+            let server = server.clone();
+            let host_override = host_override.clone();
+            let this_client = self.client.clone();
+            futs.push(async move {
+                let mut req = this_client.get(&url);
+                if let Some(h) = &host_override {
+                    req = req.header(reqwest::header::HOST, h.clone());
+                }
+                let result = async {
+                    let resp = req.send().await?;
+                    if !resp.status().is_success() {
+                        anyhow::bail!("status {}", resp.status());
+                    }
+                    let bytes = resp.bytes().await?;
+                    Ok::<Bytes, anyhow::Error>(bytes)
+                }
+                .await;
+                (server, result)
+            });
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        while let Some((server, result)) = futs.next().await {
+            match result {
+                Ok(data) => {
+                    self.mirror_pool.report_success(&server);
+                    // 其余仍在进行的请求随 futs 被 drop 时自然 abort（FuturesUnordered 析构会取消未完成 future）
+                    return Ok(data);
+                }
+                Err(e) => {
+                    self.mirror_pool.report_task_failed(&server);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all race candidates failed")))
+    }
+}

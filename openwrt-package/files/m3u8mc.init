@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+# m3u8mc procd init 脚本
+# 对应设计文档第 4 章 OpenWrt 集成
+
+USE_PROCD=1
+START=90
+STOP=10
+
+PROG=/usr/bin/m3u8mcd
+CTL=/usr/bin/m3u8mcctl
+CONFIG=/etc/config/m3u8mc
+SOCK=/var/run/m3u8mcd.sock
+
+start_service() {
+    local enabled
+    config_load m3u8mc
+    config_get_bool enabled global enabled 1
+    [ "$enabled" = "0" ] && return 0
+
+    procd_open_instance
+    procd_set_param command "$PROG" --config "$CONFIG"
+    procd_set_param respawn 3600 5 5   # 1h 窗口内最多 5 次重启，之后不再自动重启
+    procd_set_param stderr 1
+    procd_set_param stdout 1
+    procd_set_param file "$CONFIG"     # 文件变化时 procd 自动重启服务
+    procd_close_instance
+}
+
+stop_service() {
+    service_stop "$PROG"
+}
+
+reload_service() {
+    # 热重载：通知 daemon 重新读配置，未变更频道的状态保留
+    if [ -S "$SOCK" ]; then
+        "$CTL" --socket "$SOCK" reload && return 0
+        echo "m3u8mcctl reload failed, falling back to restart"
+    fi
+    restart
+}
+
+# 向 LuCI 后端和 hotplug 脚本暴露 running 状态
+service_running() {
+    [ -S "$SOCK" ] && \
+        "$CTL" --socket "$SOCK" status > /dev/null 2>&1
+}
