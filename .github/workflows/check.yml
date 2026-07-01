@@ -202,14 +202,28 @@ jobs:
           ln -s "${{ github.workspace }}/m3u8mc/openwrt-package" \
             "$SDK_DIR/package/m3u8mc"
           cd "$SDK_DIR"
+          export TERM=linux
           make defconfig 2>&1
-          echo "✅ Config generated, compiling..."
+          # 显式启用 luci 子包（defconfig 不会自动包含）
+          echo "CONFIG_PACKAGE_luci-app-m3u8mc=m" >> .config
+          make defconfig 2>&1
+          echo "Config ready"
+
+          # 先编译 m3u8mc（核心包，使用预编译二进制）
           RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
-            make package/m3u8mc/compile package/luci-app-m3u8mc/compile V=s 2>&1 || {
-            echo "❌ compilation failed"
+            make package/m3u8mc/compile V=s 2>&1 || {
+            echo "m3u8mc compilation failed"
             exit 1
           }
-          echo "✅ All packages compiled"
+          echo "m3u8mc compiled"
+
+          # 再编译 luci 包（纯脚本文件，无工具链依赖）
+          RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
+            make package/luci-app-m3u8mc/compile V=s 2>&1 || {
+            echo "luci-app-m3u8mc compilation failed"
+            exit 1
+          }
+          echo "luci-app-m3u8mc compiled"
           IPK_LIST=$(find "$SDK_DIR/bin" -name "*m3u8mc*.ipk" 2>/dev/null)
           echo "$IPK_LIST"
           for ipk in $IPK_LIST; do
