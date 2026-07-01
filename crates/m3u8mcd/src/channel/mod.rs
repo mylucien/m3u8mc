@@ -131,14 +131,13 @@ impl ChannelHandle {
         }
     }
 
-    pub async fn stop_and_wait(&self) {
+    pub async fn stop_and_wait(&mut self) {
         let _ = self.stop_tx.send(true);
-        let handles = &self.join_handles;
-        if handles.is_empty() {
+        if self.join_handles.is_empty() {
             return;
         }
         // 给每个子任务最多 SHUTDOWN_TIMEOUT 时长完成退出
-        for handle in handles {
+        for handle in &mut self.join_handles {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, handle).await;
         }
     }
