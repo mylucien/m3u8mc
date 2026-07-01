@@ -176,16 +176,37 @@ jobs:
         with:
           path: m3u8mc
 
-      - name: Download ImmortalWrt SDK (x86_64)
+      - name: Cache ImmortalWrt SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: /tmp/immortalwrt-sdk-cache
+          key: immortalwrt-sdk-23.05.4-x86_64
+
+      - name: Download & extract ImmortalWrt SDK (if not cached)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           SDK_URL="https://downloads.immortalwrt.org/releases/23.05.4/targets/x86/64/immortalwrt-sdk-23.05.4-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          echo "Downloading SDK ..."
-          curl -fsSL "$SDK_URL" -o /tmp/sdk.tar.xz
-          echo "Extracting ..."
-          tar -xJf /tmp/sdk.tar.xz -C /tmp
-          SDK_DIR=$(ls -d /tmp/immortalwrt-sdk-* 2>/dev/null | head -1)
+          echo "Downloading SDK (370MB, first time only)..."
+          curl -fsSL --connect-timeout 60 --max-time 600 \
+            -o /tmp/sdk.tar.xz "$SDK_URL"
+          echo "Extracting SDK..."
+          mkdir -p /tmp/immortalwrt-sdk-cache
+          tar -xJf /tmp/sdk.tar.xz -C /tmp/immortalwrt-sdk-cache --strip-components=1
+          echo "SDK extracted to cache"
+
+      - name: Prepare SDK directory
+        run: |
+          if [ -d /tmp/immortalwrt-sdk-cache ]; then
+            SDK_DIR=/tmp/immortalwrt-sdk
+            mkdir -p $SDK_DIR
+            cp -a /tmp/immortalwrt-sdk-cache/. $SDK_DIR/
+          else
+            echo "Cache miss, finding SDK..."
+            SDK_DIR=$(ls -d /tmp/immortalwrt-sdk-* 2>/dev/null | head -1)
+          fi
           echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
-          ls -la "$SDK_DIR"
+          echo "SDK ready: $SDK_DIR"
 
       - name: Link m3u8mc and compile ipk
         run: |
