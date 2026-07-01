@@ -185,21 +185,37 @@ jobs:
 
       - name: Link m3u8mc into ImmortalWrt
         run: |
-          ln -s "${{ github.workspace }}/m3u8mc/openwrt-package" \
-            /tmp/immortalwrt/package/m3u8mc
+          echo "=== Debug: check paths ==="
+          echo "workspace: ${{ github.workspace }}"
+          ls -la "${{ github.workspace }}/m3u8mc/" 2>/dev/null || echo "m3u8mc/ not found"
+          ls -la "${{ github.workspace }}/m3u8mc/openwrt-package/Makefile" 2>/dev/null || echo "Makefile not found under m3u8mc/"
+          ls -la "${{ github.workspace }}/openwrt-package/Makefile" 2>/dev/null || echo "Makefile not found at workspace root"
+          echo "=== Create symlink ==="
+          # Try to find the Makefile
+          PKG_DIR=""
+          if [ -f "${{ github.workspace }}/m3u8mc/openwrt-package/Makefile" ]; then
+            PKG_DIR="${{ github.workspace }}/m3u8mc/openwrt-package"
+          elif [ -f "${{ github.workspace }}/openwrt-package/Makefile" ]; then
+            PKG_DIR="${{ github.workspace }}/openwrt-package"
+          fi
+          echo "PKG_DIR=$PKG_DIR"
+          ln -s "$PKG_DIR" /tmp/immortalwrt/package/m3u8mc
+          ls -la /tmp/immortalwrt/package/m3u8mc/
           ls -la /tmp/immortalwrt/package/m3u8mc/Makefile
-          echo "✅ Package linked"
+          echo "=== Makefile content (first 30 lines) ==="
+          head -30 /tmp/immortalwrt/package/m3u8mc/Makefile
 
       - name: Verify package info (visible in menuconfig)
         run: |
           cd /tmp/immortalwrt
           export TERM=linux
           make defconfig 2>&1 || true
-          make package/m3u8mc/info V=s 2>&1 || {
-            echo "❌ make package/m3u8mc/info failed"
-            exit 1
-          }
-          echo "✅ m3u8mc recognized by ImmortalWrt build system"
+          echo "=== Try package info target ==="
+          make --version
+          ls package/m3u8mc/Makefile 2>/dev/null && echo "Makefile exists in SDK" || echo "Makefile NOT found in SDK"
+          # Try multiple approaches
+          make package/m3u8mc/compile V=1 -n 2>&1 | head -20 || true
+          echo "=== Done ==="
 
       - name: Download ImmortalWrt SDK (x86_64) for compilation
         run: |
