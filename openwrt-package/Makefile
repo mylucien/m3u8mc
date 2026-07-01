@@ -8,8 +8,8 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=m3u8mc
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
-PKG_MAINTAINER:=
+PKG_RELEASE:=1z
+PKG_MAINTAINER:=yz
 PKG_LICENSE:=MIT
 
 PREBUILT_BIN_DIR:=$(CURDIR)/bin/$(RUST_TARGET_TRIPLE)
@@ -21,10 +21,12 @@ define Package/m3u8mc
   CATEGORY:=Network
   SUBMENU:=Streaming
   TITLE:=m3u8 转组播转发服务
-  # curl 用于 FFmpeg 管理页的下载功能；file 用于识别压缩包格式；
-  # tar/liblzma 用于解压 .tar.xz 静态构建（busybox 自带 tar 的 xz 支持不完整）
   DEPENDS:=+ffmpeg +curl +file +tar +liblzma
 endef
+
+# curl 用于 FFmpeg 管理页的下载功能；file 用于识别压缩包格式；
+# tar/liblzma 用于解压 .tar.xz 静态构建（busybox 自带 tar 的 xz 支持不完整）
+
 
 define Package/m3u8mc/description
   将 HTTP 单播 m3u8 直播源（支持多镜像服务器）拉流、缓存，转换为 UDP/RTP 组播推送。
