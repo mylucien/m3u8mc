@@ -9,9 +9,6 @@ local sg = m:section(NamedSection, "vlan_isolation", "vlan_isolation",
     translate("VLAN 隔离设置"))
 sg.addremove = false
 
--- 确保 section 存在（首次使用时自动创建）
-m.uci:add_or_replace("m3u8mc", "vlan_isolation", "vlan_isolation")
-
 local enabled = sg:option(Flag, "enabled", translate("启用网络隔离"))
 enabled.rmempty = false
 
