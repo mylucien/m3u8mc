@@ -2,11 +2,6 @@
 -- 注册四个菜单项：频道管理 / 网络隔离 / FFmpeg 管理 / 运行状态
 module("luci.controller.m3u8mc", package.seeall)
 
-local nixio = require "nixio"
-local dispatcher = require "luci.dispatcher"
-local entry = dispatcher.entry
-local firstchild = dispatcher.firstchild
-
 function index()
     if not nixio.fs.access("/etc/config/m3u8mc") then
         return
