@@ -1,6 +1,5 @@
--- LuCI CBI model: m3u8mc 频道管理（概览表格）
-local m = Map("m3u8mc", translate("m3u8mc 频道管理"),
-    translate("概览频道输出信息。完整参数请在 UCI 配置文件 /etc/config/m3u8mc 中编辑。"))
+-- LuCI CBI model: m3u8mc 频道管理
+local m = Map("m3u8mc", translate("m3u8mc 频道管理"))
 
 -- 全局设置
 local s_global = m:section(NamedSection, "global", "global", translate("全局设置"))
@@ -24,7 +23,7 @@ ffmpeg_s:option(Value, "ffmpeg_download_url_aarch64", translate("aarch64"))
 ffmpeg_s:option(Value, "ffmpeg_download_url_armv7l",  translate("armv7l"))
 ffmpeg_s:option(Value, "ffmpeg_download_url_i686",    translate("i686"))
 
--- 频道列表
+-- 频道列表（概览显示关键字段，点击 Edit 配置全部参数）
 local s = m:section(TypedSection, "channel", translate("频道列表"))
 s.template = "cbi/tblsection"
 s.addremove = true
@@ -34,9 +33,19 @@ s:option(Flag, "enabled", translate("启用"))
 s:option(Value, "name", translate("频道名称"))
 s:option(Value, "addr", translate("输出地址"))
 s:option(Value, "port", translate("输出端口"))
+
 local p = s:option(ListValue, "protocol", translate("协议"))
 p:value("udp", "UDP")
 p:value("rtp", "RTP")
+
+s:option(Value, "url", translate("源地址"))
+s:option(Value, "iface", translate("出口"))
+s:option(Value, "ttl", translate("TTL"))
+
+local dl = s:option(Flag, "use_downloader", translate("缓存"))
+dl.default = "1"
+s:option(DynamicList, "ffmpeg_input_arg", translate("ffmpeg入参"))
+s:option(DynamicList, "ffmpeg_output_arg", translate("ffmpeg出参"))
 
 -- 重载钩子
 m.on_after_commit = function(self)
