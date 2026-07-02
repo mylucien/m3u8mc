@@ -1,59 +1,83 @@
--- LuCI CBI model: m3u8mc 频道管理
-local m = Map("m3u8mc", translate("m3u8mc 频道管理"))
+-- LuCI CBI model: m3u8mc 频道列表页
+-- 只展示关键列；编辑跳转到独立的 channel_edit.lua
 
--- 全局设置
-local s_global = m:section(NamedSection, "global", "global", translate("全局设置"))
-s_global.addremove = false
-s_global:option(Flag, "enabled", translate("启用插件"))
+local m = Map("m3u8mc", translate("m3u8mc 转播"))
 
-local log_opt = s_global:option(Value, "log_level", translate("日志级别"))
-log_opt:value("error", "error")
-log_opt:value("warning", "warning (默认)")
-log_opt:value("info", "info")
-log_opt:value("debug", "debug (详细)")
+-- ── 全局设置 ──────────────────────────────────────────────────
+local sg = m:section(NamedSection, "global", "global", translate("全局设置"))
+sg.addremove = false
 
-s_global:option(Value, "http_port_base", translate("内部 HTTP 起始端口"))
-s_global:option(Value, "control_socket", translate("控制 Socket 路径"))
+sg:option(Flag, "enabled", translate("启用插件"))
 
--- FFmpeg 下载地址
-local ffmpeg_s = m:section(NamedSection, "global", "global", translate("FFmpeg 下载地址"))
-ffmpeg_s.addremove = false
-ffmpeg_s:option(Value, "ffmpeg_download_url_x86_64",  translate("x86_64"))
-ffmpeg_s:option(Value, "ffmpeg_download_url_aarch64", translate("aarch64"))
-ffmpeg_s:option(Value, "ffmpeg_download_url_armv7l",  translate("armv7l"))
-ffmpeg_s:option(Value, "ffmpeg_download_url_i686",    translate("i686"))
+local log_opt = sg:option(ListValue, "log_level", translate("日志级别"))
+log_opt:value("error",   "error")
+log_opt:value("warning", "warning（默认）")
+log_opt:value("info",    "info")
+log_opt:value("m3u8mcd=debug,info", "debug（详细）")
+log_opt.default = "warning"
 
--- 频道列表（概览显示关键字段，点击 Edit 配置全部参数）
+local pb = sg:option(Value, "http_port_base", translate("HTTP 起始端口"),
+    translate("各频道未指定端口时从此值起递增自动分配"))
+pb.placeholder = "18080"
+pb.datatype    = "port"
+
+local sock = sg:option(Value, "control_socket", translate("控制 Socket"),
+    translate("m3u8mcctl 与 daemon 通信的 Unix Socket 路径"))
+sock.placeholder = "/var/run/m3u8mcd.sock"
+
+-- ── 频道列表 ──────────────────────────────────────────────────
 local s = m:section(TypedSection, "channel", translate("频道列表"))
-s.template = "cbi/tblsection"
+s.template  = "cbi/tblsection"
 s.addremove = true
 s.anonymous = false
+-- 自定义"添加"时跳到编辑页
+s.create = function(self, section)
+    local stat, err = TypedSection.create(self, section)
+    if stat then
+        luci.http.redirect(
+            luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") ..
+            "?section=" .. section
+        )
+    end
+    return stat, err
+end
 
-s:option(Flag, "enabled", translate("启用"))
-s:option(Value, "name", translate("频道名称"))
-s:option(Value, "addr", translate("输出地址"))
-s:option(Value, "port", translate("输出端口"))
+s:option(Flag,  "enabled",  translate("启用"))
+s:option(Value, "name",     translate("频道名称"))
 
-local p = s:option(ListValue, "protocol", translate("协议"))
-p:value("udp", "UDP")
-p:value("rtp", "RTP")
+-- 输出地址列（只读展示，不可内联编辑）
+local addr_col = s:option(Value, "addr", translate("输出地址"))
+addr_col.readonly = true
 
-s:option(Value, "url", translate("源地址"))
-s:option(Value, "iface", translate("出口"))
-s:option(Value, "ttl", translate("TTL"))
+s:option(Value, "port",     translate("端口"))
 
-local dl = s:option(Flag, "use_downloader", translate("缓存"))
-dl.default = "1"
-s:option(DynamicList, "ffmpeg_input_arg", translate("ffmpeg入参"))
-s:option(DynamicList, "ffmpeg_output_arg", translate("ffmpeg出参"))
+local proto_col = s:option(ListValue, "protocol", translate("协议"))
+proto_col:value("rtp", "RTP")
+proto_col:value("udp", "UDP")
 
--- 重载钩子
+-- 编辑按钮列：跳转到独立编辑页
+local edit_btn = s:option(Button, "_edit", translate("操作"))
+edit_btn.inputstyle = "edit"
+edit_btn.inputtitle = translate("编辑")
+function edit_btn.write(self, section)
+    luci.http.redirect(
+        luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") ..
+        "?section=" .. section
+    )
+end
+
+-- ── 保存后热重载 ──────────────────────────────────────────────
 m.on_after_commit = function(self)
-    local sys = require "luci.sys"
-    local uci2 = require "luci.model.uci".cursor()
-    local sock = uci2:get("m3u8mc", "global", "control_socket") or "/var/run/m3u8mcd.sock"
-    local _, code = sys.exec(string.format("/usr/bin/m3u8mcctl --socket %q reload 2>/dev/null", sock))
-    if code ~= 0 then sys.call("/etc/init.d/m3u8mc restart") end
+    local sys  = require "luci.sys"
+    local uci2 = require("luci.model.uci").cursor()
+    local sock_path = uci2:get("m3u8mc", "global", "control_socket")
+                      or "/var/run/m3u8mcd.sock"
+    local _, code = sys.exec(
+        string.format("/usr/bin/m3u8mcctl --socket %q reload 2>/dev/null", sock_path)
+    )
+    if code ~= 0 then
+        sys.call("/etc/init.d/m3u8mc restart")
+    end
 end
 
 return m
