@@ -9,11 +9,11 @@ local s_global = m:section(NamedSection, "global", "global", translate("全局�
 s_global.addremove = false
 
 s_global:option(Flag,  "enabled",       translate("启用插件"))
-s_global:option(Value, "log_level",     translate("日志级别"))
-             :value("error",   "error")
-             :value("warning", "warning (默认)")
-             :value("info",    "info")
-             :value("debug",   "debug (详细)")
+local log_level = s_global:option(Value, "log_level",     translate("日志级别"))
+log_level:value("error",   "error")
+log_level:value("warning", "warning (默认)")
+log_level:value("info",    "info")
+log_level:value("debug",   "debug (详细)")
 s_global:option(Value, "http_port_base", translate("内部 HTTP 起始端口"),
     translate("各频道按此递增自动分配，范围 1024–65000"))
 s_global:option(Value, "control_socket", translate("控制 Socket 路径"))
@@ -21,14 +21,14 @@ s_global:option(Value, "control_socket", translate("控制 Socket 路径"))
 -- ffmpeg 下载地址（按架构）
 local ffmpeg_s = m:section(NamedSection, "global", "global", translate("FFmpeg 下载地址"))
 ffmpeg_s.addremove = false
-ffmpeg_s:option(Value, "ffmpeg_download_url_x86_64",  translate("x86_64 下载地址"))
-         :placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz")
-ffmpeg_s:option(Value, "ffmpeg_download_url_aarch64", translate("aarch64 下载地址"))
-         :placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz")
-ffmpeg_s:option(Value, "ffmpeg_download_url_armv7l",  translate("armv7l 下载地址"))
-         :placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-armhf-static.tar.xz")
-ffmpeg_s:option(Value, "ffmpeg_download_url_i686",    translate("i686 下载地址"))
-         :placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz")
+local url_x86 = ffmpeg_s:option(Value, "ffmpeg_download_url_x86_64",  translate("x86_64 下载地址"))
+url_x86:placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz")
+local url_aa = ffmpeg_s:option(Value, "ffmpeg_download_url_aarch64", translate("aarch64 下载地址"))
+url_aa:placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz")
+local url_arm = ffmpeg_s:option(Value, "ffmpeg_download_url_armv7l",  translate("armv7l 下载地址"))
+url_arm:placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-armhf-static.tar.xz")
+local url_i6 = ffmpeg_s:option(Value, "ffmpeg_download_url_i686",    translate("i686 下载地址"))
+url_i6:placeholder("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz")
 
 -- ── 频道列表 ────────────────────────────────────────────────
 local s = m:section(TypedSection, "channel", translate("频道列表"))
