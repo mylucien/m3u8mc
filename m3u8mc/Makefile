@@ -43,7 +43,7 @@ define Package/m3u8mc/install
 	$(INSTALL_CONF) ./files/m3u8mc.config $(1)/etc/config/m3u8mc
 
 	$(INSTALL_DIR) $(1)/usr/share/m3u8mc
-	$(INSTALL_DATA) ./files/network-isolation.sh \
+	$(INSTALL_BIN) ./files/network-isolation.sh \
 	    $(1)/usr/share/m3u8mc/network-isolation.sh
 	$(INSTALL_BIN) ./files/ffmpeg-install.sh \
 	    $(1)/usr/share/m3u8mc/ffmpeg-install.sh
