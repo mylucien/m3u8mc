@@ -45,7 +45,23 @@ proto_opt:value("udp", "UDP")
 proto_opt:value("rtp", "RTP")
 s:option(Value, "addr", translate("组播地址"))
 s:option(Value, "port", translate("组播端口"))
-s:option(Value, "iface", translate("出口接口"))
+-- 出口接口选择（自动读取系统接口 + 支持手动输入 IP）
+local iface = s:option(Value, "iface", translate("出口接口"),
+    translate("选择 OpenWrt 接口名，或直接填本机 IP 地址"))
+iface.rmempty = true
+-- 动态读取系统网络接口作为下拉选项
+local devs = require("luci.sys").net.devices()
+if devs then
+    for _, dev in ipairs(devs) do
+        if dev ~= "lo" and not dev:match("^ifb") and not dev:match("^tun") then
+            iface:value(dev)
+        end
+    end
+end
+-- 补充常见 OpenWrt 逻辑接口名
+iface:value("lan")
+iface:value("wan")
+iface:value("br-lan")
 s:option(Value, "ttl",  translate("TTL"))
 
 -- 下载/转发模式
