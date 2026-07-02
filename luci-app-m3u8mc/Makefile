@@ -49,12 +49,10 @@ define Package/luci-app-m3u8mc/install
 	$(INSTALL_DATA) ./luci/htdocs/m3u8mc-status.js \
 	    $(1)/www/luci-static/resources/m3u8mc-status.js
 
-	# ACL 文件（新版 ImmortalWrt 必须，否则菜单不显示）
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./acl.d/luci-app-m3u8mc.json \
 	    $(1)/usr/share/rpcd/acl.d/luci-app-m3u8mc.json
 
-	# menu.d 文件（新版菜单注册）
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./menu.d/luci-app-m3u8mc.json \
 	    $(1)/usr/share/luci/menu.d/luci-app-m3u8mc.json
