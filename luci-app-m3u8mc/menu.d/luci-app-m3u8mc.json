@@ -1,0 +1,12 @@
+{
+    "admin/services/m3u8mc": {
+        "title": "m3u8mc 转播",
+        "action": {
+            "type": "firstchild"
+        },
+        "depends": {
+            "acl": [ "luci-app-m3u8mc" ],
+            "fs": { "/etc/config/m3u8mc": "file" }
+        }
+    }
+}
