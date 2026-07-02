@@ -210,7 +210,18 @@ function preview_sec.render(self, ...)
     fd.append('action', action);
     fetch('/cgi-bin/luci/admin/services/m3u8mc/api/isolation_apply', {
       method: 'POST', body: fd
-    }).then(function(r) { return r.json(); })
+    }).then(function(r) {
+      if (!r.ok) {
+        throw new Error('HTTP ' + r.status);
+      }
+      return r.text().then(function(txt) {
+        try {
+          return JSON.parse(txt);
+        } catch (e) {
+          throw new Error('JSON parse failed: ' + txt.substring(0,100));
+        }
+      });
+    })
       .then(function(d) {
         if (d.ok) {
           res.style.color = '#3c763d';
@@ -224,7 +235,7 @@ function preview_sec.render(self, ...)
       })
       .catch(function(e) {
         res.style.color = '#a94442';
-        res.textContent = '请求失败：' + e;
+        res.textContent = '请求失败：' + e.message;
       });
   };
 })();
