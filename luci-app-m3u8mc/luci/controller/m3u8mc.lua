@@ -15,30 +15,9 @@ function index()
           cbi("m3u8mc/channels"), _("频道管理"), 10)
 
     -- 频道编辑页（独立路由，不出现在菜单）
-    -- leaf=true  : dispatcher 不再向下匹配子路径
-    -- i18n=false : 避免 ucode bridge 因找不到 po 目录而抛 "Model not found"
     local ce = entry({"admin", "services", "m3u8mc", "channel_edit"},
           cbi("m3u8mc/channel_edit"), nil, nil)
     ce.leaf = true
-    ce.i18n = false
-
-    -- Bug 3 fix: 新增频道 —— 纯 GET 跳转的 controller 动作（call()），
-    -- 不经过 CBI Map/TypedSection 的 create 流程。
-    -- 原因：新版 LuCI 的 TypedSection 添加按钮是纯前端 AJAX 局部刷新，
-    -- 在 Lua 的 create() 里调用 http.redirect() 不会触发浏览器整页跳转；
-    -- 而 call() 是一次普通的 HTTP 请求/响应，redirect 一定生效。
-    local ca = entry({"admin", "services", "m3u8mc", "channel_add"},
-          call("channel_add"), nil, nil)
-    ca.leaf  = true
-    ca.i18n  = false
-
-    -- Bug 3 fix: 删除频道 —— 同样用普通 controller 动作实现，
-    -- 替代 TypedSection.addremove 自带的删除按钮（同一个开关会连
-    -- 添加框一起带出来，索性都不用，改成显式链接更可控）。
-    local cd = entry({"admin", "services", "m3u8mc", "channel_del"},
-          call("channel_del"), nil, nil)
-    cd.leaf  = true
-    cd.i18n  = false
 
     entry({"admin", "services", "m3u8mc", "isolation"},
           cbi("m3u8mc/isolation"), _("网络隔离"), 20)
@@ -70,57 +49,6 @@ function index()
 
     entry({"admin", "services", "m3u8mc", "api", "ffmpeg_reset"},
           call("api_ffmpeg_reset")).leaf = true
-end
-
--- ── 频道新增 / 删除（Bug 3 fix）───────────────────────────────
--- 两个函数都是普通 HTTP 请求处理（call()），不是 cbi()，
--- 所以里面的 luci.http.redirect() 是真正的 302 整页跳转，
--- 不会被前端 AJAX 吞掉。
-
-function channel_add()
-    local http = require "luci.http"
-    local uci  = require("luci.model.uci").cursor()
-
-    -- uci:add() 生成匿名段名（形如 cfgXXXXXX），并写入内存态；
-    -- 需要 save+commit 落盘，否则下一次请求 channel_edit 时
-    -- uci:get("m3u8mc", section) 会读不到该段而被打回频道列表。
-    local name = uci:add("m3u8mc", "channel")
-    if name then
-        uci:set("m3u8mc", name, "enabled", "1")
-        uci:save("m3u8mc")
-        uci:commit("m3u8mc")
-        http.redirect(
-            luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit")
-            .. "?section=" .. name
-        )
-    else
-        http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
-    end
-end
-
-function channel_del()
-    local http = require "luci.http"
-    local sys  = require "luci.sys"
-    local uci  = require("luci.model.uci").cursor()
-    local section = http.formvalue("section")
-
-    -- uci:get(config, section) 不带 option 参数时返回该段的类型（字符串），
-    -- 用来确认这确实是一个 channel 段，防止误删别的配置段。
-    if section and section ~= "" and uci:get("m3u8mc", section) == "channel" then
-        uci:delete("m3u8mc", section)
-        uci:save("m3u8mc")
-        uci:commit("m3u8mc")
-
-        local sock_path = uci:get("m3u8mc", "global", "control_socket")
-                           or "/var/run/m3u8mcd.sock"
-        local _, code = sys.exec(
-            string.format("/usr/bin/m3u8mcctl --socket %q reload 2>/dev/null", sock_path)
-        )
-        if not code or code ~= 0 then
-            sys.call("/etc/init.d/m3u8mc restart")
-        end
-    end
-    http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
 end
 
 -- ── API handlers（原样保留）────────────────────────────────────

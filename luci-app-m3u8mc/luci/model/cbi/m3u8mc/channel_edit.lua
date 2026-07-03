@@ -1,19 +1,25 @@
 -- LuCI CBI model: m3u8mc 频道编辑页
+-- 覆盖 ChannelConfig 的全部 20 个 UCI 字段（见 config.rs）
+-- 通过 ?section=<name> 参数确定编辑目标
 
-local http  = require "luci.http"
-local uci_r = require("luci.model.uci").cursor()
-local sys   = require "luci.sys"
+local http    = require "luci.http"
+local uci_r   = require("luci.model.uci").cursor()
+local sys     = require "luci.sys"
 
--- section name 通过 ?section=<n> 传入。
--- 浏览器提交 POST 时会保留 query string，因此 GET/POST 均有效。
+-- Bug 3 fix: 原表达式 "or http.formvalue('cbi.submit') and nil" 因运算符优先级
+-- 会将右侧解析为 (http.formvalue('cbi.submit') and nil)，使 section 永远可能为 nil。
+-- 直接取 "section" 参数即可。
 local section = http.formvalue("section")
 
+-- 若 URL 里没有 section 参数，回到列表页
 if not section or section == "" then
     http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
     return
 end
 
-if not uci_r:get("m3u8mc", section) then
+-- 确保该 section 存在（新建时 create 已建好空 section）
+local sec_type = uci_r:get("m3u8mc", section)
+if not sec_type then
     http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
     return
 end
@@ -22,25 +28,17 @@ local m = Map("m3u8mc",
     translate("编辑频道"),
     translate("修改后点击「保存并应用」，daemon 将热重载受影响的频道。"))
 
-m.redirect = luci.dispatcher.build_url("admin/services/m3u8mc/channels")
-
+-- 锁定到指定 section
 local s = m:section(NamedSection, section, "channel")
 s.addremove = false
--- NamedSection 必须 anonymous=true：
---   false 时框架用 cbid.<cfg>._.<opt> 格式寻找 POST 字段（用于动态 section 名），
---   true  时用 cbid.<cfg>.<section>.<opt>，与浏览器实际提交的 key 匹配。
--- 设错会导致除 Flag 外所有字段的值全部丢失。
-s.anonymous = true
+s.anonymous = false
 
 -- ── 基础信息 ──────────────────────────────────────────────────
-local enabled = s:option(Flag, "enabled", translate("启用频道"))
-enabled.default = "1"
-enabled.rmempty = false
+local name = s:option(Value, "name", translate("频道名称"))
+name.rmempty = false
+name.placeholder = "如：澳视体育"
 
-local name_opt = s:option(Value, "name", translate("频道名称"))
-name_opt.rmempty = false
-name_opt.placeholder = "如：澳视体育"
-
+-- 镜像源地址（list url，多行动态列表）
 local url = s:option(DynamicList, "url", translate("镜像源地址"),
     translate("内容相同的多个镜像 URL，逐行填写；直通模式下只允许一条"))
 url.placeholder = "http://..."
@@ -62,6 +60,7 @@ port.placeholder = "1234"
 port.datatype    = "port"
 port.rmempty     = false
 
+-- 出口接口：从 network.interface 动态读取，同时允许手填 IP
 local iface = s:option(Value, "iface", translate("出口接口"),
     translate("ffmpeg 推流绑定的本地接口，运行时解析为 IP；也可直接填 IP 地址"))
 iface.placeholder = "lan"
@@ -78,7 +77,7 @@ local use_dl = s:option(Flag, "use_downloader", translate("启用缓存下载器
 use_dl.default  = "1"
 use_dl.rmempty  = false
 
--- ── 下载策略 ────────────────────────────────────────────────
+-- ── 高级选项：下载策略（标准模式下可见）────────────────────
 local race = s:option(Flag, "race_mode", translate("启用赛马下载策略"),
     translate("并发向所有节点请求同一分片，取响应最快者；会成倍增加带宽消耗"))
 race.default = "0"
@@ -96,9 +95,9 @@ threads.datatype    = "uinteger"
 threads.default     = "4"
 threads:depends("use_downloader", "1")
 
--- ── 缓存参数 ────────────────────────────────────────────────
+-- ── 高级选项：缓存参数 ────────────────────────────────────────
 local cache_w = s:option(Value, "cache_window", translate("缓存窗口倍数"),
-    translate("分片保留时长 = 分片时长 × 此值（秒）"))
+    translate("分片保留时长 = 分片时长 × 此值（秒）；应 ≥ hls_segments 覆盖的时间跨度"))
 cache_w.placeholder = "3"
 cache_w.datatype    = "uinteger"
 cache_w.default     = "3"
@@ -121,7 +120,9 @@ hls_seg:depends("use_downloader", "1")
 local http_port = s:option(Value, "http_port", translate("内部 HTTP 端口"),
     translate("留空则从全局 http_port_base 自动分配；直通模式下忽略此项"))
 http_port.placeholder = "留空自动分配"
-http_port.validate = function(self, value, sec)
+-- Bug 4 fix: LuCI datatype 不支持 "or(port, \"\")" 复合语法，改用自定义 validate。
+-- 空值直接放行（由 Rust 侧处理自动分配），非空时做 1–65535 范围校验。
+http_port.validate = function(self, value, section)
     if not value or value == "" then return value end
     local n = tonumber(value)
     if n and n >= 1 and n <= 65535 then return value end
@@ -134,7 +135,7 @@ http_path.placeholder = "/live"
 http_path.default     = "/live"
 http_path:depends("use_downloader", "1")
 
--- ── 推流参数 ────────────────────────────────────────────────
+-- ── 高级选项：推流参数 ────────────────────────────────────────
 local ttl = s:option(Value, "ttl", translate("TTL"),
     translate("组播 TTL，控制数据包可跨越的路由器跳数"))
 ttl.placeholder = "4"
@@ -142,7 +143,7 @@ ttl.datatype    = "range(1,255)"
 ttl.default     = "4"
 
 local pkt_size = s:option(Value, "pkt_size", translate("UDP 包大小（pkt_size）"),
-    translate("推荐 1316 = 7 × 188 字节（单个 MPEG-TS 包）"))
+    translate("推荐 1316 = 7 × 188 字节（单个 MPEG-TS 包），避免包边界跨越导致接收端拆包错误"))
 pkt_size.placeholder = "1316"
 pkt_size.datatype    = "uinteger"
 pkt_size.default     = "1316"
@@ -153,31 +154,36 @@ buf.placeholder = "1048576"
 buf.datatype    = "uinteger"
 buf.default     = "1048576"
 
--- ── 自定义请求头 ────────────────────────────────────────────
+-- ── 自定义请求头 ────────────────────────────────────────────────
 local hdr = s:option(DynamicList, "http_header", translate("自定义 HTTP 请求头"),
-    translate("每行格式：Header-Name: value。常用：User-Agent、Referer、Origin。"))
+    translate("每行格式：Header-Name: value。常用：User-Agent、Referer、Origin。\n" ..
+              "留空时 Poller 和 Downloader 均使用 reqwest 默认 UA；\n" ..
+              "填写后所有拉流请求（playlist + 分片）都会携带这些头。"))
 hdr.placeholder = "User-Agent: Mozilla/5.0 (Linux; Android 10)"
 
--- ── ffmpeg 自定义参数 ────────────────────────────────────────
+-- ── ffmpeg 自定义参数 ─────────────────────────────────────────
 local fin = s:option(DynamicList, "ffmpeg_input_arg", translate("ffmpeg 额外输入参数"),
     translate("追加在 -i 之前；留空时 daemon 自动加 -analyzeduration/-probesize 5000000"))
 fin.placeholder = "-re"
 
 local fout = s:option(DynamicList, "ffmpeg_output_arg", translate("ffmpeg 额外输出参数"),
-    translate("追加在 -i 之后；非空则完全覆盖 daemon 默认输出参数"))
+    translate("追加在 -i 之后；留空时 daemon 自动应用兼容性默认组合（pcr_period/muxdelay/bsf:v 等）；非空则完全覆盖默认值"))
 fout.placeholder = "-pcr_period"
 
--- ── 保存后热重载 ─────────────────────────────────────────────
+-- ── 保存后热重载 ──────────────────────────────────────────────
 m.on_after_commit = function(self)
-    local uci2      = require("luci.model.uci").cursor()
+    local uci2     = require("luci.model.uci").cursor()
     local sock_path = uci2:get("m3u8mc", "global", "control_socket")
                       or "/var/run/m3u8mcd.sock"
     local _, code = sys.exec(
         string.format("/usr/bin/m3u8mcctl --socket %q reload 2>/dev/null", sock_path)
     )
+    -- Bug 5 fix: sys.exec 命令不存在时 code 为 nil，需先判 nil 再比较
     if not code or code ~= 0 then
         sys.call("/etc/init.d/m3u8mc restart")
     end
+    -- 保存后跳回列表页
+    http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
 end
 
 return m

@@ -36,8 +36,6 @@ define Package/luci-app-m3u8mc/install
 	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/model/cbi/m3u8mc
 	$(INSTALL_DATA) ./luci/model/cbi/m3u8mc/channels.lua \
 	    $(1)/usr/lib/lua/luci/model/cbi/m3u8mc/channels.lua
-	$(INSTALL_DATA) ./luci/model/cbi/m3u8mc/channel_edit.lua \
-	    $(1)/usr/lib/lua/luci/model/cbi/m3u8mc/channel_edit.lua
 	$(INSTALL_DATA) ./luci/model/cbi/m3u8mc/isolation.lua \
 	    $(1)/usr/lib/lua/luci/model/cbi/m3u8mc/isolation.lua
 
