@@ -60,22 +60,16 @@ impl ChannelHandle {
         } else {
             DownloadStrategy::RoundRobin
         };
-        let race_host = config
-            .urls
-            .first()
-            .and_then(|u| url::Url::parse(u).ok())
-            .and_then(|u| u.host_str().map(|s| s.to_string()));
-
         let downloader = Downloader::new(
             Arc::clone(&mirror_pool),
             Arc::clone(&cache),
             strategy,
             config.threads,
             config.race_ips.clone(),
-            race_host,
+            &config.http_headers,
         );
 
-        let poller = Poller::new(Arc::clone(&mirror_pool), Arc::clone(&downloader), config.urls.clone());
+        let poller = Poller::new(Arc::clone(&mirror_pool), Arc::clone(&downloader), config.urls.clone(), &config.http_headers);
         let poller_handle = tokio::spawn(poller.run(stop_rx.clone()));
 
         let http_port = config.http_port.expect("standard mode requires http_port to be set");

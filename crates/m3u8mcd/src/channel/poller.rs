@@ -5,7 +5,7 @@
 //! - 检测 sequence 异常回退（上游重启）并重置追踪基线；
 //! - media url 连续失败达到阈值后判定 token 失效，触发重新解析 master playlist。
 
-use super::downloader::{Downloader, SegmentTask};
+use super::downloader::{parse_headers, Downloader, SegmentTask};
 use super::m3u8::{self, ParsedPlaylist};
 use super::mirror_pool::MirrorPool;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,10 +37,13 @@ impl Poller {
         mirror_pool: Arc<MirrorPool>,
         downloader: Arc<Downloader>,
         origin_urls: Vec<String>,
+        http_headers: &[String],
     ) -> Arc<Self> {
+        let default_headers = parse_headers(http_headers);
         Arc::new(Poller {
             client: reqwest::Client::builder()
                 .timeout(MEDIA_FETCH_TIMEOUT)
+                .default_headers(default_headers)
                 .build()
                 .expect("failed to build reqwest client"),
             mirror_pool,
@@ -99,6 +102,14 @@ impl Poller {
             bases.push(dir);
             media_urls.push(media_url);
         }
+
+        // 更新 race_host 为 media playlist 所在域名（修复跨域名场景下 race_host 推导错误）
+        // 必须在 master 解析完成后才能确定，不能在 Downloader 初始化时静态推导。
+        let media_host = media_urls
+            .first()
+            .and_then(|u| url::Url::parse(u).ok())
+            .and_then(|u| u.host_str().map(|s| s.to_string()));
+        self.downloader.set_race_host(media_host);
 
         *self.media_urls.lock().unwrap() = media_urls;
         Ok(bases)

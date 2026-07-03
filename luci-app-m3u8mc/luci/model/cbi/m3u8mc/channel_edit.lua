@@ -144,6 +144,13 @@ buf.placeholder = "1048576"
 buf.datatype    = "uinteger"
 buf.default     = "1048576"
 
+-- ── 自定义请求头 ────────────────────────────────────────────────
+local hdr = s:option(DynamicList, "http_header", translate("自定义 HTTP 请求头"),
+    translate("每行格式：Header-Name: value。常用：User-Agent、Referer、Origin。\n" ..
+              "留空时 Poller 和 Downloader 均使用 reqwest 默认 UA；\n" ..
+              "填写后所有拉流请求（playlist + 分片）都会携带这些头。"))
+hdr.placeholder = "User-Agent: Mozilla/5.0 (Linux; Android 10)"
+
 -- ── ffmpeg 自定义参数 ─────────────────────────────────────────
 local fin = s:option(DynamicList, "ffmpeg_input_arg", translate("ffmpeg 额外输入参数"),
     translate("追加在 -i 之前；留空时 daemon 自动加 -analyzeduration/-probesize 5000000"))

@@ -63,6 +63,9 @@ pub struct ChannelConfig {
     pub use_downloader: bool,
     pub race_mode: bool,
     pub race_ips: Vec<String>,
+    /// 自定义 HTTP 请求头（如 User-Agent、Referer），用于 Poller 和 Downloader 的所有请求。
+    /// UCI 格式：list http_header 'User-Agent: Mozilla/5.0'
+    pub http_headers: Vec<String>,
     pub ffmpeg_input_args: Vec<String>,
     pub ffmpeg_output_args: Vec<String>,
 }
@@ -196,6 +199,7 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
             use_downloader,
             race_mode: sec.get_bool("race_mode", false),
             race_ips: sec.list("race_ip").iter().filter(|s| !s.is_empty()).cloned().collect(),
+            http_headers: sec.list("http_header").iter().filter(|s| !s.is_empty()).cloned().collect(),
             ffmpeg_input_args: sec.list("ffmpeg_input_arg").iter().filter(|s| !s.is_empty()).cloned().collect(),
             ffmpeg_output_args: sec.list("ffmpeg_output_arg").iter().filter(|s| !s.is_empty()).cloned().collect(),
         };

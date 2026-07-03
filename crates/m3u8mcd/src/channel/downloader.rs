@@ -10,7 +10,8 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashSet;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use std::sync::Arc;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -46,7 +47,11 @@ pub struct Downloader {
     strategy: DownloadStrategy,
     threads: usize,
     race_ips: Vec<String>,
-    race_host: Option<String>,
+    /// media playlist 解析完成后由 Poller 动态写入，初始为 None。
+    /// 使用 RwLock 以便 Poller 和 Downloader 并发访问。
+    race_host: RwLock<Option<String>>,
+    /// 所有对外 HTTP 请求附带的默认头（UA、Referer 等）。
+    default_headers: HeaderMap,
     overloaded: std::sync::atomic::AtomicBool,
 }
 
@@ -57,12 +62,14 @@ impl Downloader {
         strategy: DownloadStrategy,
         threads: usize,
         race_ips: Vec<String>,
-        race_host: Option<String>,
+        http_headers: &[String],
     ) -> Arc<Self> {
         let n_servers = mirror_pool.server_count().max(1);
         let permits = (n_servers * 3).max(6);
+        let default_headers = parse_headers(http_headers);
         let client = reqwest::Client::builder()
             .timeout(WHOLE_DOWNLOAD_TIMEOUT)
+            .default_headers(default_headers.clone())
             .build()
             .expect("failed to build reqwest client");
         Arc::new(Downloader {
@@ -74,9 +81,16 @@ impl Downloader {
             strategy,
             threads: threads.max(1),
             race_ips,
-            race_host,
+            race_host: RwLock::new(None),
+            default_headers,
             overloaded: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Poller 解析完 master playlist 后调用，更新 race_host 为 media URL 的 host。
+    /// 这样赛马模式向 race_ips 发请求时，Host 头携带的是分片所在域名而非 master 域名。
+    pub fn set_race_host(&self, host: Option<String>) {
+        *self.race_host.write().unwrap() = host;
     }
 
     pub fn is_overloaded(&self) -> bool {
@@ -301,7 +315,7 @@ impl Downloader {
             } else {
                 format!("http://{ip}")
             };
-            candidates.push((base, self.race_host.clone()));
+            candidates.push((base, self.race_host.read().unwrap().clone()));
         }
 
         if candidates.is_empty() {
@@ -348,6 +362,26 @@ impl Downloader {
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all race candidates failed")))
     }
+}
+
+/// 把 UCI list http_header 的字符串列表解析为 reqwest HeaderMap。
+/// 每条格式为 "Header-Name: value"，解析失败的条目记录 warn 后跳过。
+pub fn parse_headers(raw: &[String]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for entry in raw {
+        match entry.splitn(2, ':').collect::<Vec<_>>().as_slice() {
+            [name, value] => {
+                let name = name.trim();
+                let value = value.trim();
+                match (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+                    (Ok(n), Ok(v)) => { map.insert(n, v); }
+                    _ => tracing::warn!(entry, "invalid http_header entry, skipping"),
+                }
+            }
+            _ => tracing::warn!(entry, "http_header entry missing ':', skipping"),
+        }
+    }
+    map
 }
 
 #[cfg(test)]
