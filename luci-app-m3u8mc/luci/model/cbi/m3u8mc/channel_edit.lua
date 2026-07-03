@@ -4,12 +4,9 @@ local http  = require "luci.http"
 local uci_r = require("luci.model.uci").cursor()
 local sys   = require "luci.sys"
 
--- section name 先查 POST body，再查 URL 路径（/channel_edit/<section>）
+-- section name 通过 ?section=<n> 传入。
+-- 浏览器提交 POST 时会保留 query string，因此 GET/POST 均有效。
 local section = http.formvalue("section")
-if not section or section == "" then
-    local pi = http.getenv("PATH_INFO") or ""
-    section = pi:match("/([^/]+)$")
-end
 
 if not section or section == "" then
     http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
@@ -36,6 +33,10 @@ s.addremove = false
 s.anonymous = true
 
 -- ── 基础信息 ──────────────────────────────────────────────────
+local enabled = s:option(Flag, "enabled", translate("启用频道"))
+enabled.default = "1"
+enabled.rmempty = false
+
 local name_opt = s:option(Value, "name", translate("频道名称"))
 name_opt.rmempty = false
 name_opt.placeholder = "如：澳视体育"

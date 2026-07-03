@@ -28,16 +28,21 @@ sock.placeholder = "/var/run/m3u8mcd.sock"
 -- ── 频道列表 ──────────────────────────────────────────────────
 local s = m:section(TypedSection, "channel", translate("频道列表"))
 s.template  = "cbi/tblsection"
-s.addremove = true
+-- Bug 3 fix: 不再使用 TypedSection 自带的 addremove。
+-- 原因：addremove=true 时，LuCI 会在表格下方弹出一个
+-- 「文本框（输入新段名）+ Add 按钮」的组合（因为 anonymous 默认为 false），
+-- 这就是你看到的"只有两个东西"；而且这个 Add 走的是前端 AJAX 局部刷新，
+-- 不会整页跳转到编辑页。所以这里关掉它，改用下面的自定义链接。
+s.addremove = false
 s.anonymous = false
+
 -- Bug 1 fix: 使用标准 extedit 替代自定义 Button.write；
 -- LuCI tblsection 会在每行渲染一个「编辑」链接，自动拼入 section name
-s.extedit = luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") .. "/%s"
+s.extedit = luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") .. "?section=%s"
 
--- Bug 1 fix: 新建时跳转到编辑页（create 留在 TypedSection 标准流程中，
--- 新建频道：TypedSection 标准 create 建好空 section 后，
--- extedit 机制会自动在下一次请求渲染时给出「编辑」入口。
--- 不在 create 里调 http.redirect，避免与 CBI 框架响应流程冲突。
+-- Bug 1 fix: 新建时跳转到编辑页——见 Bug 3 fix：新增已改为
+-- 独立的 channel_add controller 动作（controller/m3u8mc.lua），
+-- 不再依赖 TypedSection 的 create 流程。
 
 -- Bug 1 fix: 列表页只读展示，改用 DummyValue（不可内联编辑）
 s:option(Flag,       "enabled",  translate("启用"))
@@ -49,6 +54,36 @@ local proto_col = s:option(DummyValue, "protocol", translate("协议"))
 proto_col.cfgvalue = function(self, section)
     local v = self.map:get(section, "protocol") or "rtp"
     return v:upper()
+end
+
+-- Bug 3 fix: 删除按钮改为链接到独立的 channel_del controller 动作，
+-- 原来 TypedSection.addremove 自带的删除按钮已经关闭（见上）。
+local del_col = s:option(DummyValue, "_del", translate("操作"))
+del_col.rawhtml = true
+del_col.cfgvalue = function(self, section)
+    local url = luci.dispatcher.build_url("admin/services/m3u8mc/channel_del")
+                .. "?section=" .. section
+    local confirm_msg = translate("确定要删除该频道吗？此操作不可撤销。")
+    return string.format(
+        '<a class="btn cbi-button cbi-button-remove" href="%s" ' ..
+        'onclick="return confirm(\'%s\');">%s</a>',
+        url, confirm_msg, translate("删除")
+    )
+end
+
+-- ── 新增频道按钮（Bug 3 fix）────────────────────────────────────
+-- 用普通 <a> 链接触发整页 GET 跳转到 channel_add，
+-- 由 channel_add 建好一个空的 channel 段后再 302 到 channel_edit，
+-- 用户填完全部参数一次性提交，不会先经过阉割版的“添加框”。
+local addsec = m:section(SimpleSection)
+local addbtn = addsec:option(DummyValue, "_add")
+addbtn.rawhtml = true
+addbtn.cfgvalue = function()
+    local url = luci.dispatcher.build_url("admin/services/m3u8mc/channel_add")
+    return string.format(
+        '<a class="btn cbi-button cbi-button-add" href="%s">%s</a>',
+        url, translate("新增频道")
+    )
 end
 
 -- ── 保存后热重载 ──────────────────────────────────────────────
