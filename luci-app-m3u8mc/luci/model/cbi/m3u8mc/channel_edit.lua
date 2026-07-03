@@ -24,6 +24,9 @@ local m = Map("m3u8mc",
 
 m.redirect = luci.dispatcher.build_url("admin/services/m3u8mc/channels")
 
+-- 注入隐藏字段，确保 POST 提交时 section 参数不丢失
+m.hidden = { section = section }
+
 local s = m:section(NamedSection, section, "channel")
 s.addremove = false
 -- NamedSection 必须 anonymous=true：
