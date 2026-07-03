@@ -15,7 +15,7 @@ define Package/m3u8mc
   CATEGORY:=Network
   SUBMENU:=Streaming
   TITLE:=m3u8 转组播转发服务
-  DEPENDS:=+ffmpeg +curl +file +tar +liblzma
+  DEPENDS:=+ffmpeg +curl +file +tar +liblzma +kmod-v4l2loopback
 endef
 
 define Package/m3u8mc/description
