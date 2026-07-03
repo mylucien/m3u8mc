@@ -50,7 +50,7 @@ pub async fn serve(
         .route(&stream_route, get(stream_handler))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, %playlist_route, "internal http server listening");
 
