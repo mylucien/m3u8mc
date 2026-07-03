@@ -1,17 +1,25 @@
 -- LuCI CBI model: m3u8mc 频道编辑页
--- 覆盖 ChannelConfig 的全部 20 个 UCI 字段（见 config.rs）
--- 通过 ?section=<name> 参数确定编辑目标
+-- 覆盖 ChannelConfig 的全部字段（见 config.rs）
+--
+-- 设计要点：
+--   * section name 通过 URL query string ?section=<n> 传入，
+--     在 Map 构造之前读取，用于绑定 NamedSection。
+--   * POST 提交时 LuCI dispatcher 先解析整个 request，
+--     http.formvalue("section") 在 GET 和 POST 时均有效；
+--     但为了让 CBI 框架能正确回填表单，section 必须也出现在
+--     隐藏字段里——通过 m.hidden 注入（见下）。
+--   * on_after_commit 不调用 http.redirect；
+--     改用 m.redirect 让 CBI 自己在保存后跳转，
+--     避免与框架的响应流程冲突导致保存"无效"。
 
-local http    = require "luci.http"
-local uci_r   = require("luci.model.uci").cursor()
-local sys     = require "luci.sys"
+local http  = require "luci.http"
+local uci_r = require("luci.model.uci").cursor()
+local sys   = require "luci.sys"
 
--- Bug 3 fix: 原表达式 "or http.formvalue('cbi.submit') and nil" 因运算符优先级
--- 会将右侧解析为 (http.formvalue('cbi.submit') and nil)，使 section 永远可能为 nil。
--- 直接取 "section" 参数即可。
+-- section 在 GET（初次打开）和 POST（表单提交）时都通过 query string 传递；
+-- channels.lua 的 extedit 和 create 均保证拼入 ?section=<n>
 local section = http.formvalue("section")
 
--- 若 URL 里没有 section 参数，回到列表页
 if not section or section == "" then
     http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
     return
@@ -27,6 +35,13 @@ end
 local m = Map("m3u8mc",
     translate("编辑频道"),
     translate("修改后点击「保存并应用」，daemon 将热重载受影响的频道。"))
+
+-- 把 section 注入为隐藏字段，使 POST 提交时 formvalue("section") 仍能拿到正确值
+-- （即便浏览器不把 query string 附在 POST body 里）
+m.hidden = { section = section }
+
+-- 保存成功后跳回列表页（由 CBI 框架在完成 commit 后执行，不冲突）
+m.redirect = luci.dispatcher.build_url("admin/services/m3u8mc/channels")
 
 -- 锁定到指定 section
 local s = m:section(NamedSection, section, "channel")
@@ -120,9 +135,8 @@ hls_seg:depends("use_downloader", "1")
 local http_port = s:option(Value, "http_port", translate("内部 HTTP 端口"),
     translate("留空则从全局 http_port_base 自动分配；直通模式下忽略此项"))
 http_port.placeholder = "留空自动分配"
--- Bug 4 fix: LuCI datatype 不支持 "or(port, \"\")" 复合语法，改用自定义 validate。
--- 空值直接放行（由 Rust 侧处理自动分配），非空时做 1–65535 范围校验。
-http_port.validate = function(self, value, section)
+-- 空值放行（Rust 侧自动分配），非空做 1–65535 范围校验
+http_port.validate = function(self, value, sec)
     if not value or value == "" then return value end
     local n = tonumber(value)
     if n and n >= 1 and n <= 65535 then return value end
@@ -171,19 +185,18 @@ local fout = s:option(DynamicList, "ffmpeg_output_arg", translate("ffmpeg 额外
 fout.placeholder = "-pcr_period"
 
 -- ── 保存后热重载 ──────────────────────────────────────────────
+-- 注意：不在此处调用 http.redirect，改用 m.redirect 让 CBI 框架
+-- 在完成 uci commit 后自行跳转，避免与框架响应流程冲突导致保存"无效"。
 m.on_after_commit = function(self)
-    local uci2     = require("luci.model.uci").cursor()
+    local uci2      = require("luci.model.uci").cursor()
     local sock_path = uci2:get("m3u8mc", "global", "control_socket")
                       or "/var/run/m3u8mcd.sock"
     local _, code = sys.exec(
         string.format("/usr/bin/m3u8mcctl --socket %q reload 2>/dev/null", sock_path)
     )
-    -- Bug 5 fix: sys.exec 命令不存在时 code 为 nil，需先判 nil 再比较
     if not code or code ~= 0 then
         sys.call("/etc/init.d/m3u8mc restart")
     end
-    -- 保存后跳回列表页
-    http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
 end
 
 return m

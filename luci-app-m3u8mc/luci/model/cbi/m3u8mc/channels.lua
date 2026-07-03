@@ -35,17 +35,9 @@ s.anonymous = false
 s.extedit = luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") .. "?section=%s"
 
 -- Bug 1 fix: 新建时跳转到编辑页（create 留在 TypedSection 标准流程中，
--- 点击「添加」先创建空 section 再由 extedit 跳转过去）
-s.create = function(self, section)
-    local stat, err = TypedSection.create(self, section)
-    if stat then
-        luci.http.redirect(
-            luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") ..
-            "?section=" .. section
-        )
-    end
-    return stat, err
-end
+-- 新建频道：TypedSection 标准 create 建好空 section 后，
+-- extedit 机制会自动在下一次请求渲染时给出「编辑」入口。
+-- 不在 create 里调 http.redirect，避免与 CBI 框架响应流程冲突。
 
 -- Bug 1 fix: 列表页只读展示，改用 DummyValue（不可内联编辑）
 s:option(Flag,       "enabled",  translate("启用"))
