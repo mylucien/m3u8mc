@@ -56,7 +56,8 @@ pub async fn serve(
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::time::timeout(Duration::from_secs(4), stop_rx.changed()).await;
+            let _ = stop_rx.changed().await;
+            // axum 收到信号后 drain 已有连接，然后 serve() 返回
         })
         .await?;
     Ok(())
