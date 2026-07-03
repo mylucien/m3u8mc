@@ -15,9 +15,12 @@ function index()
           cbi("m3u8mc/channels"), _("频道管理"), 10)
 
     -- 频道编辑页（独立路由，不出现在菜单）
+    -- leaf=true  : dispatcher 不再向下匹配子路径
+    -- i18n=false : 避免 ucode bridge 因找不到 po 目录而抛 "Model not found"
     local ce = entry({"admin", "services", "m3u8mc", "channel_edit"},
           cbi("m3u8mc/channel_edit"), nil, nil)
     ce.leaf = true
+    ce.i18n = false
 
     entry({"admin", "services", "m3u8mc", "isolation"},
           cbi("m3u8mc/isolation"), _("网络隔离"), 20)
