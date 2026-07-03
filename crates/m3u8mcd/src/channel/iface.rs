@@ -45,6 +45,7 @@ async fn resolve_via_ubus(iface: &str) -> Option<String> {
 }
 
 async fn resolve_via_ip_command(iface: &str) -> Option<String> {
+    // 先尝试 JSON 模式（iproute2 完整版支持）
     let output = Command::new("ip")
         .arg("-4")
         .arg("-j")
@@ -54,16 +55,45 @@ async fn resolve_via_ip_command(iface: &str) -> Option<String> {
         .output()
         .await
         .ok()?;
+    if output.status.success() {
+        let result = serde_json::from_slice::<Value>(&output.stdout).ok();
+        if let Some(json) = result {
+            if let Some(ip) = json.as_array()?
+                .first()?
+                .get("addr_info")?
+                .as_array()?
+                .first()?
+                .get("local")?
+                .as_str()
+            {
+                return Some(ip.to_string());
+            }
+        }
+    }
+
+    // 回退：BusyBox ip 不支持 -j，改用文本解析
+    let output = Command::new("ip")
+        .arg("-4")
+        .arg("addr")
+        .arg("show")
+        .arg(iface)
+        .output()
+        .await
+        .ok()?;
     if !output.status.success() {
         return None;
     }
-    let json: Value = serde_json::from_slice(&output.stdout).ok()?;
-    json.as_array()?
-        .first()?
-        .get("addr_info")?
-        .as_array()?
-        .first()?
-        .get("local")?
-        .as_str()
-        .map(|s| s.to_string())
+    let text = String::from_utf8_lossy(&output.stdout);
+    // 解析 "inet 10.100.0.1/24 ..."
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("inet ") {
+            if let Some(ip) = rest.split('/').next() {
+                if !ip.is_empty() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
 }
