@@ -125,7 +125,29 @@ impl Downloader {
         }
     }
 
+    /// 将 server_base 与 rel_path 拼接为完整 URL。
+    ///
+    /// 按 HLS 规范（RFC 8216 §4.1）处理两种相对路径形式：
+    /// - 根路径相对（以 `/` 开头，如 `/api/amty/2283368`）：
+    ///   相对于 origin（scheme://host），而非 media playlist 目录。
+    ///   示例：base="https://cdn.hi.hn/163189" + rel="/api/amty/1"
+    ///         → "https://cdn.hi.hn/api/amty/1"
+    /// - 目录相对（不以 `/` 开头，如 `seg100.ts`）：
+    ///   拼在 base 目录后，与原行为一致。
     fn build_url(server_base: &str, rel_path: &str) -> String {
+        // 尝试用 url::Url::join 做规范解析（最准确）
+        // server_base 可能是目录形式（无尾 /）需补上 / 才能让 join 在正确目录下工作
+        let base_with_slash = if server_base.ends_with('/') {
+            server_base.to_string()
+        } else {
+            format!("{}/", server_base)
+        };
+        if let Ok(base_url) = url::Url::parse(&base_with_slash) {
+            if let Ok(joined) = base_url.join(rel_path) {
+                return joined.to_string();
+            }
+        }
+        // 回退：原始字符串拼接（仅用于 server_base 本身不是合法 URL 的边缘情况）
         let base = server_base.trim_end_matches('/');
         let rel = rel_path.trim_start_matches('/');
         format!("{base}/{rel}")
@@ -325,5 +347,39 @@ impl Downloader {
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all race candidates failed")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_url_root_relative() {
+        // 根路径相对（以 / 开头）：应相对于 origin，而非 media playlist 目录
+        // 场景：media url = https://6.cdn.hi.hn/163189/amty
+        //       poller base = https://6.cdn.hi.hn/163189
+        //       分片路径 = /api/amty/2283368
+        assert_eq!(
+            Downloader::build_url("https://6.cdn.hi.hn/163189", "/api/amty/2283368"),
+            "https://6.cdn.hi.hn/api/amty/2283368"
+        );
+    }
+
+    #[test]
+    fn build_url_relative_no_slash() {
+        // 普通相对路径（不以 / 开头）：拼在 base 目录后
+        assert_eq!(
+            Downloader::build_url("https://cdn.example.com/live", "seg100.ts"),
+            "https://cdn.example.com/live/seg100.ts"
+        );
+    }
+
+    #[test]
+    fn build_url_already_absolute() {
+        // 分片路径本身是绝对 URL（部分 CDN 会这样）
+        let abs = "https://other.cdn.com/seg100.ts";
+        let result = Downloader::build_url("https://cdn.example.com/live", abs);
+        assert_eq!(result, abs);
     }
 }
