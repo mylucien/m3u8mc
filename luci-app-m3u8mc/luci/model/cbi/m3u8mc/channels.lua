@@ -32,7 +32,7 @@ s.addremove = true
 s.anonymous = false
 -- Bug 1 fix: 使用标准 extedit 替代自定义 Button.write；
 -- LuCI tblsection 会在每行渲染一个「编辑」链接，自动拼入 section name
-s.extedit = luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") .. "?section=%s"
+s.extedit = luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") .. "/%s"
 
 -- Bug 1 fix: 新建时跳转到编辑页（create 留在 TypedSection 标准流程中，
 -- 新建频道：TypedSection 标准 create 建好空 section 后，

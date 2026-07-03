@@ -4,9 +4,12 @@ local http  = require "luci.http"
 local uci_r = require("luci.model.uci").cursor()
 local sys   = require "luci.sys"
 
--- section name 通过 ?section=<n> 传入。
--- 浏览器提交 POST 时会保留 query string，因此 GET/POST 均有效。
+-- section name 先查 POST body，再查 URL 路径（/channel_edit/<section>）
 local section = http.formvalue("section")
+if not section or section == "" then
+    local pi = http.getenv("PATH_INFO") or ""
+    section = pi:match("/([^/]+)$")
+end
 
 if not section or section == "" then
     http.redirect(luci.dispatcher.build_url("admin/services/m3u8mc/channels"))
@@ -23,9 +26,6 @@ local m = Map("m3u8mc",
     translate("修改后点击「保存并应用」，daemon 将热重载受影响的频道。"))
 
 m.redirect = luci.dispatcher.build_url("admin/services/m3u8mc/channels")
-
--- 注入隐藏字段，确保 POST 提交时 section 参数不丢失
-m.hidden = { section = section }
 
 local s = m:section(NamedSection, section, "channel")
 s.addremove = false
