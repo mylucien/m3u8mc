@@ -6,7 +6,10 @@ local http    = require "luci.http"
 local uci_r   = require("luci.model.uci").cursor()
 local sys     = require "luci.sys"
 
-local section = http.formvalue("section") or http.formvalue("cbi.submit") and nil
+-- Bug 3 fix: 原表达式 "or http.formvalue('cbi.submit') and nil" 因运算符优先级
+-- 会将右侧解析为 (http.formvalue('cbi.submit') and nil)，使 section 永远可能为 nil。
+-- 直接取 "section" 参数即可。
+local section = http.formvalue("section")
 
 -- 若 URL 里没有 section 参数，回到列表页
 if not section or section == "" then
@@ -117,7 +120,14 @@ hls_seg:depends("use_downloader", "1")
 local http_port = s:option(Value, "http_port", translate("内部 HTTP 端口"),
     translate("留空则从全局 http_port_base 自动分配；直通模式下忽略此项"))
 http_port.placeholder = "留空自动分配"
-http_port.datatype    = "or(port, \"\")"
+-- Bug 4 fix: LuCI datatype 不支持 "or(port, \"\")" 复合语法，改用自定义 validate。
+-- 空值直接放行（由 Rust 侧处理自动分配），非空时做 1–65535 范围校验。
+http_port.validate = function(self, value, section)
+    if not value or value == "" then return value end
+    local n = tonumber(value)
+    if n and n >= 1 and n <= 65535 then return value end
+    return nil, translate("端口号须为 1–65535 之间的整数")
+end
 http_port:depends("use_downloader", "1")
 
 local http_path = s:option(Value, "http_path", translate("内部 HTTP 路径"))
@@ -168,7 +178,8 @@ m.on_after_commit = function(self)
     local _, code = sys.exec(
         string.format("/usr/bin/m3u8mcctl --socket %q reload 2>/dev/null", sock_path)
     )
-    if code ~= 0 then
+    -- Bug 5 fix: sys.exec 命令不存在时 code 为 nil，需先判 nil 再比较
+    if not code or code ~= 0 then
         sys.call("/etc/init.d/m3u8mc restart")
     end
     -- 保存后跳回列表页

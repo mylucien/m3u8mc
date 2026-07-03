@@ -117,10 +117,7 @@ function api_isolation_apply()
     if code == 0 then
         http.write('{"ok":true}')
     else
-        -- 手动转义确保 JSON 合法
-        local err = tostring(out):gsub("%s+$", "")
-        err = err:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r')
-        http.write('{"error":"' .. err .. '"}')
+        http.write(string.format('{"error":%q}', tostring(out)))
     end
 end
 

@@ -9,6 +9,13 @@ local sg = m:section(NamedSection, "vlan_isolation", "vlan_isolation",
     translate("VLAN 隔离设置"))
 sg.addremove = false
 
+-- Bug 6a fix: LuCI UCI cursor 没有 add_or_replace 方法，会在运行时报错。
+-- 改用标准 API：先 get 判断是否存在，不存在时再 set 创建（已存在则无副作用）。
+if not m.uci:get("m3u8mc", "vlan_isolation") then
+    m.uci:set("m3u8mc", "vlan_isolation", "vlan_isolation")
+    m.uci:save("m3u8mc")
+end
+
 local enabled = sg:option(Flag, "enabled", translate("启用网络隔离"))
 enabled.rmempty = false
 
@@ -210,18 +217,7 @@ function preview_sec.render(self, ...)
     fd.append('action', action);
     fetch('/cgi-bin/luci/admin/services/m3u8mc/api/isolation_apply', {
       method: 'POST', body: fd
-    }).then(function(r) {
-      if (!r.ok) {
-        throw new Error('HTTP ' + r.status);
-      }
-      return r.text().then(function(txt) {
-        try {
-          return JSON.parse(txt);
-        } catch (e) {
-          throw new Error('JSON parse failed: ' + txt.substring(0,100));
-        }
-      });
-    })
+    }).then(function(r) { return r.json(); })
       .then(function(d) {
         if (d.ok) {
           res.style.color = '#3c763d';
@@ -235,7 +231,7 @@ function preview_sec.render(self, ...)
       })
       .catch(function(e) {
         res.style.color = '#a94442';
-        res.textContent = '请求失败：' + e.message;
+        res.textContent = '请求失败：' + e;
       });
   };
 })();
@@ -253,7 +249,8 @@ m.on_after_commit = function(self)
     local _, code = sys.exec(
         string.format("/usr/bin/m3u8mcctl --socket %q reload 2>/dev/null", sock)
     )
-    if code ~= 0 then
+    -- Bug 6b fix: sys.exec 命令不存在时 code 为 nil，需先判 nil 再比较
+    if not code or code ~= 0 then
         sys.call("/etc/init.d/m3u8mc restart")
     end
 end

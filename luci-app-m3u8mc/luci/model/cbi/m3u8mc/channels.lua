@@ -30,7 +30,12 @@ local s = m:section(TypedSection, "channel", translate("频道列表"))
 s.template  = "cbi/tblsection"
 s.addremove = true
 s.anonymous = false
--- 自定义"添加"时跳到编辑页
+-- Bug 1 fix: 使用标准 extedit 替代自定义 Button.write；
+-- LuCI tblsection 会在每行渲染一个「编辑」链接，自动拼入 section name
+s.extedit = luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") .. "?section=%s"
+
+-- Bug 1 fix: 新建时跳转到编辑页（create 留在 TypedSection 标准流程中，
+-- 点击「添加」先创建空 section 再由 extedit 跳转过去）
 s.create = function(self, section)
     local stat, err = TypedSection.create(self, section)
     if stat then
@@ -42,28 +47,16 @@ s.create = function(self, section)
     return stat, err
 end
 
-s:option(Flag,  "enabled",  translate("启用"))
-s:option(Value, "name",     translate("频道名称"))
+-- Bug 1 fix: 列表页只读展示，改用 DummyValue（不可内联编辑）
+s:option(Flag,       "enabled",  translate("启用"))
+s:option(DummyValue, "name",     translate("频道名称"))
+s:option(DummyValue, "addr",     translate("输出地址"))
+s:option(DummyValue, "port",     translate("端口"))
 
--- 输出地址列（只读展示，不可内联编辑）
-local addr_col = s:option(Value, "addr", translate("输出地址"))
-addr_col.readonly = true
-
-s:option(Value, "port",     translate("端口"))
-
-local proto_col = s:option(ListValue, "protocol", translate("协议"))
-proto_col:value("rtp", "RTP")
-proto_col:value("udp", "UDP")
-
--- 编辑按钮列：跳转到独立编辑页
-local edit_btn = s:option(Button, "_edit", translate("操作"))
-edit_btn.inputstyle = "edit"
-edit_btn.inputtitle = translate("编辑")
-function edit_btn.write(self, section)
-    luci.http.redirect(
-        luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") ..
-        "?section=" .. section
-    )
+local proto_col = s:option(DummyValue, "protocol", translate("协议"))
+proto_col.cfgvalue = function(self, section)
+    local v = self.map:get(section, "protocol") or "rtp"
+    return v:upper()
 end
 
 -- ── 保存后热重载 ──────────────────────────────────────────────
@@ -75,7 +68,8 @@ m.on_after_commit = function(self)
     local _, code = sys.exec(
         string.format("/usr/bin/m3u8mcctl --socket %q reload 2>/dev/null", sock_path)
     )
-    if code ~= 0 then
+    -- Bug 2 fix: sys.exec 在命令不存在时返回 nil，需先判断 nil 再比较值
+    if not code or code ~= 0 then
         sys.call("/etc/init.d/m3u8mc restart")
     end
 end

@@ -50,8 +50,9 @@ pub struct Downloader {
     /// media playlist 解析完成后由 Poller 动态写入，初始为 None。
     /// 使用 RwLock 以便 Poller 和 Downloader 并发访问。
     race_host: RwLock<Option<String>>,
-    /// 所有对外 HTTP 请求附带的默认头（UA、Referer 等）。
-    default_headers: HeaderMap,
+    // Bug 7 fix: 已删除 default_headers 死字段。
+    // client 构造时已通过 .default_headers(default_headers.clone()) 持有该 HeaderMap，
+    // struct 里的副本只写不读，属于死代码。
     overloaded: std::sync::atomic::AtomicBool,
 }
 
@@ -82,7 +83,6 @@ impl Downloader {
             threads: threads.max(1),
             race_ips,
             race_host: RwLock::new(None),
-            default_headers,
             overloaded: std::sync::atomic::AtomicBool::new(false),
         })
     }
