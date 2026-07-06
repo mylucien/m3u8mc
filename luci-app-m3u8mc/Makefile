@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-m3u8mc
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_MAINTAINER:=wupengyan
 PKG_LICENSE:=MIT
 
@@ -21,7 +21,7 @@ endef
 
 define Package/luci-app-m3u8mc/description
   LuCI management interface for m3u8mc: channel management,
-  network isolation, FFmpeg download/install, and status monitoring.
+  realtime log viewer, and status monitoring.
 endef
 
 define Build/Compile
@@ -38,18 +38,12 @@ define Package/luci-app-m3u8mc/install
 	    $(1)/usr/lib/lua/luci/model/cbi/m3u8mc/channels.lua
 	$(INSTALL_DATA) ./luci/model/cbi/m3u8mc/channel_edit.lua \
 	    $(1)/usr/lib/lua/luci/model/cbi/m3u8mc/channel_edit.lua
-	$(INSTALL_DATA) ./luci/model/cbi/m3u8mc/isolation.lua \
-	    $(1)/usr/lib/lua/luci/model/cbi/m3u8mc/isolation.lua
 
 	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/view/m3u8mc
 	$(INSTALL_DATA) ./luci/view/m3u8mc/status.htm \
 	    $(1)/usr/lib/lua/luci/view/m3u8mc/status.htm
-	$(INSTALL_DATA) ./luci/view/m3u8mc/ffmpeg.htm \
-	    $(1)/usr/lib/lua/luci/view/m3u8mc/ffmpeg.htm
-
-	$(INSTALL_DIR) $(1)/www/luci-static/resources
-	$(INSTALL_DATA) ./luci/htdocs/m3u8mc-status.js \
-	    $(1)/www/luci-static/resources/m3u8mc-status.js
+	$(INSTALL_DATA) ./luci/view/m3u8mc/log.htm \
+	    $(1)/usr/lib/lua/luci/view/m3u8mc/log.htm
 
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./acl.d/luci-app-m3u8mc.json \
