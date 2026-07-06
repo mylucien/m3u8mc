@@ -114,7 +114,7 @@ threads:depends("use_downloader", "1")
 
 -- ── 高级选项：独立列表拉取配置 ────────────────────────────────
 local list_url = s:option(DynamicList, "list_url", translate("列表专用地址（可选）"),
-    translate("仅当"获取 m3u8 列表"与"下载 ts 分片"需要走不同源时才配置。\n" ..
+    translate("仅当'获取 m3u8 列表'与'下载 ts 分片'需要走不同源时才配置。\n" ..
               "留空则用上方镜像源地址来拉取列表（原有行为）。\n" ..
               "填写后，列表拉取走这里配置的地址，分片下载走上方镜像源地址。"))
 list_url.placeholder = "http://list.origin.com/index.m3u8"
