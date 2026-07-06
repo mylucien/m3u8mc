@@ -1,15 +1,12 @@
 -- LuCI CBI model: m3u8mc 频道编辑页
 -- 覆盖 ChannelConfig 的全部 UCI 字段（见 config.rs）
--- 通过 ?section=<name> 参数确定编辑目标
+-- 通过 URL 路径参数 /channel_edit/<name> 确定编辑目标
 
 local http    = require "luci.http"
 local uci_r   = require("luci.model.uci").cursor()
 local sys     = require "luci.sys"
 
--- Bug fix: 原表达式 "or http.formvalue('cbi.submit') and nil" 因运算符优先级
--- 会将右侧解析为 (http.formvalue('cbi.submit') and nil)，使 section 永远可能为 nil。
--- 直接取 "section" 参数即可。
-local section = http.formvalue("section")
+local section = arg and arg[1]
 
 -- 若 URL 里没有 section 参数，回到列表页
 if not section or section == "" then
@@ -27,11 +24,6 @@ end
 local m = Map("m3u8mc",
     translate("编辑频道"),
     translate("修改后点击「保存并应用」，daemon 将热重载受影响的频道。"))
-
--- ── Bug fix: POST 提交时 query string 丢失导致 section=nil 保存失败 ──────────
--- LuCI CBI 表单的 action 不带 query string，因此 ?section=xxx 在 POST 时丢失。
--- 将 section 注入为隐藏字段，使 POST body 中始终携带该值。
-m.hidden = { section = section }
 
 -- 锁定到指定 section
 local s = m:section(NamedSection, section, "channel")
