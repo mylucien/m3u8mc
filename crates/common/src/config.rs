@@ -62,12 +62,56 @@ pub struct ChannelConfig {
     pub http_path: String,
     pub use_downloader: bool,
     pub race_mode: bool,
+    /// 赛马模式候选地址。每条支持两种写法：
+    /// - `1.2.3.4`：纯 IP/地址，不带专属域名，实际 Host 走 race_host 配置或自动推断兜底；
+    /// - `1.2.3.4@mirror2.cdn.com`：显式指定该地址对应的域名（Host 覆盖），
+    ///   用于标准模式镜像池本身存在多个不同域名镜像时，让每个赛马 IP 精确匹配自己的域名。
+    /// UCI: list race_ip '1.2.3.4' / list race_ip '5.6.7.8@mirror2.cdn.com'
     pub race_ips: Vec<String>,
-    /// 自定义 HTTP 请求头（如 User-Agent、Referer），用于 Poller 和 Downloader 的所有请求。
-    /// UCI 格式：list http_header 'User-Agent: Mozilla/5.0'
+    /// 全局默认赛马 Host，当某个 race_ip 没有用 @host 指定专属域名时使用；
+    /// 若也未配置本项，则回退到自动推断（media playlist 第一个镜像的域名，旧行为）。
+    /// 优先级：race_ip 自带的 @host > 本项 > 自动推断。
+    /// UCI: option race_host 'cdn.example.com'
+    pub race_host: String,
     pub http_headers: Vec<String>,
+    pub poller_http_headers: Vec<String>,
+    pub downloader_http_headers: Vec<String>,
+    pub list_urls: Vec<String>,
+    pub list_poll_interval_secs: f32,
+    pub list_proxy: String,
+    pub download_proxy: String,
     pub ffmpeg_input_args: Vec<String>,
     pub ffmpeg_output_args: Vec<String>,
+}
+
+impl ChannelConfig {
+    /// 实际用于拉取列表（Poller）的源地址：
+    /// 优先使用独立配置的 list_urls，未配置时回退到 urls（向后兼容旧配置）。
+    pub fn effective_list_urls(&self) -> &[String] {
+        if self.list_urls.is_empty() {
+            &self.urls
+        } else {
+            &self.list_urls
+        }
+    }
+
+    /// 实际用于 Poller 请求的 HTTP 头：未单独配置 poller_http_headers 时回退到公共 http_headers。
+    pub fn effective_poller_headers(&self) -> &[String] {
+        if self.poller_http_headers.is_empty() {
+            &self.http_headers
+        } else {
+            &self.poller_http_headers
+        }
+    }
+
+    /// 实际用于 Downloader 请求的 HTTP 头：未单独配置 downloader_http_headers 时回退到公共 http_headers。
+    pub fn effective_downloader_headers(&self) -> &[String] {
+        if self.downloader_http_headers.is_empty() {
+            &self.http_headers
+        } else {
+            &self.downloader_http_headers
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -199,7 +243,14 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
             use_downloader,
             race_mode: sec.get_bool("race_mode", false),
             race_ips: sec.list("race_ip").iter().filter(|s| !s.is_empty()).cloned().collect(),
+            race_host: sec.get_or("race_host", ""),
             http_headers: sec.list("http_header").iter().filter(|s| !s.is_empty()).cloned().collect(),
+            poller_http_headers: sec.list("poller_http_header").iter().filter(|s| !s.is_empty()).cloned().collect(),
+            downloader_http_headers: sec.list("downloader_http_header").iter().filter(|s| !s.is_empty()).cloned().collect(),
+            list_urls: sec.list("list_url").iter().filter(|s| !s.is_empty()).cloned().collect(),
+            list_poll_interval_secs: sec.get_parsed("list_poll_interval", 0.0f32),
+            list_proxy: sec.get_or("list_proxy", ""),
+            download_proxy: sec.get_or("download_proxy", ""),
             ffmpeg_input_args: sec.list("ffmpeg_input_arg").iter().filter(|s| !s.is_empty()).cloned().collect(),
             ffmpeg_output_args: sec.list("ffmpeg_output_arg").iter().filter(|s| !s.is_empty()).cloned().collect(),
         };
