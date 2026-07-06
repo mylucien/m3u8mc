@@ -1,0 +1,190 @@
+name: Build FFmpeg Static (Alpine Docker)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  FFMPEG_VERSION: 8.0.1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Build in Alpine container
+      run: |
+        # 创建编译脚本
+        cat > build-ffmpeg.sh << 'EOF'
+        #!/bin/sh
+        set -ex
+        
+        FFMPEG_VERSION=8.0.1
+        
+        # 安装编译依赖
+        apk add --no-cache \
+          build-base \
+          gcc \
+          make \
+          yasm \
+          nasm \
+          git \
+          ca-certificates \
+          wget \
+          pkgconfig \
+          libaom-dev \
+          libass-dev \
+          libbluray-dev \
+          libdav1d-dev \
+          libdrm-dev \
+          fontconfig-dev \
+          freetype-dev \
+          fribidi-dev \
+          harfbuzz-dev \
+          libjxl-dev \
+          libmp3lame-dev \
+          libopenmpt-dev \
+          libopus-dev \
+          libplacebo-dev \
+          libpulse-dev \
+          librav1e-dev \
+          librist-dev \
+          libshaderc-dev \
+          libsoxr-dev \
+          libsrt-dev \
+          libssh-dev \
+          libtheora-dev \
+          libv4l-dev \
+          libvidstab-dev \
+          libvorbis-dev \
+          libvpx-dev \
+          libwebp-dev \
+          x264-dev \
+          x265-dev \
+          libxcb-dev \
+          libxml2-dev \
+          libxvidcore-dev \
+          libzimg-dev \
+          libzmq-dev \
+          lv2-dev \
+          openssl-dev \
+          vulkan-headers \
+          libsvtav1-dev \
+          libvpl-dev \
+          libva-dev \
+          libvdpau-dev \
+          alsa-lib-dev \
+          libx11-dev \
+          libxext-dev \
+          libxfixes-dev \
+          libxcb-shape-dev \
+          libxcb-xfixes-dev \
+          libdrm-dev \
+          mesa-dev \
+          libglvnd-dev \
+          libpcre2-dev
+        
+        # 下载源码
+        cd /tmp
+        wget -q https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz
+        tar -xf ffmpeg-${FFMPEG_VERSION}.tar.xz
+        cd ffmpeg-${FFMPEG_VERSION}
+        
+        # 配置（与容器内完全一致）
+        ./configure \
+          --prefix=/usr \
+          --disable-librtmp \
+          --disable-lzma \
+          --disable-stripping \
+          --enable-static \
+          --disable-shared \
+          --enable-avfilter \
+          --enable-gpl \
+          --enable-ladspa \
+          --enable-libaom \
+          --enable-libass \
+          --enable-libbluray \
+          --enable-libdav1d \
+          --enable-libdrm \
+          --enable-libfontconfig \
+          --enable-libfreetype \
+          --enable-libfribidi \
+          --enable-libharfbuzz \
+          --enable-libjxl \
+          --enable-libmp3lame \
+          --enable-libopenmpt \
+          --enable-libopus \
+          --enable-libplacebo \
+          --enable-libpulse \
+          --enable-librav1e \
+          --enable-librist \
+          --enable-libshaderc \
+          --enable-libsoxr \
+          --enable-libsrt \
+          --enable-libssh \
+          --enable-libtheora \
+          --enable-libv4l2 \
+          --enable-libvidstab \
+          --enable-libvorbis \
+          --enable-libvpx \
+          --enable-libwebp \
+          --enable-libx264 \
+          --enable-libx265 \
+          --enable-libxcb \
+          --enable-libxml2 \
+          --enable-libxvid \
+          --enable-libzimg \
+          --enable-libzmq \
+          --enable-lto=auto \
+          --enable-lv2 \
+          --enable-openssl \
+          --enable-pic \
+          --enable-pthreads \
+          --enable-vaapi \
+          --enable-vdpau \
+          --enable-version3 \
+          --enable-vulkan \
+          --optflags=-O3 \
+          --enable-libsvtav1 \
+          --enable-libvpl \
+          --extra-ldflags="-static -static-libgcc -static-libstdc++" \
+          --extra-cflags="-static -I/usr/include"
+        
+        # 编译
+        make -j$(nproc)
+        
+        # 验证
+        ./ffmpeg -version
+        
+        # 复制产物
+        mkdir -p /output
+        cp ./ffmpeg /output/
+        cp ./ffprobe /output/ 2>/dev/null || true
+        
+        echo "Build complete!"
+        ls -lh /output/
+        EOF
+        
+        chmod +x build-ffmpeg.sh
+        
+        # 用 Alpine 容器执行编译
+        docker run --rm \
+          -v $(pwd):/output \
+          alpine:latest \
+          sh -c "apk add --no-cache bash && bash /output/build-ffmpeg.sh"
+        
+        # 查看产物
+        ls -lh ./ffmpeg 2>/dev/null || ls -lh ./output/
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ffmpeg-static-x86_64-alpine
+        path: |
+          ./ffmpeg
+          ./ffprobe
+        if-no-files-found: error
