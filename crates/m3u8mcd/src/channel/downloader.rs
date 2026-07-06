@@ -420,7 +420,11 @@ fn parse_race_ip_entry(entry: &str) -> (String, Option<String>) {
         Some((addr, host)) if !host.trim().is_empty() => {
             (addr.trim().to_string(), Some(host.trim().to_string()))
         }
-        _ => (entry.trim().to_string(), None),
+        // '@' 存在但 host 为空/空白（如 "1.2.3.4@" 或 "1.2.3.4@ "）：
+        // 取 '@' 前的部分作为 addr，忽略空 host。
+        Some((addr, _)) => (addr.trim().to_string(), None),
+        // 没有 '@'：整体就是 addr。
+        None => (entry.trim().to_string(), None),
     }
 }
 
