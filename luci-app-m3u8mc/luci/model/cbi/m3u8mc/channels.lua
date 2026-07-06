@@ -30,9 +30,7 @@ local s = m:section(TypedSection, "channel", translate("频道列表"))
 s.template  = "cbi/tblsection"
 s.addremove = true
 s.anonymous = false
--- Bug 1 fix: 使用标准 extedit 替代自定义 Button.write；
--- LuCI tblsection 会在每行渲染一个「编辑」链接，自动拼入 section name
-s.extedit = luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") .. "?section=%s"
+s.extedit = luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") .. "/%s"
 
 -- Bug 1 fix: 新建时跳转到编辑页（create 留在 TypedSection 标准流程中，
 -- 点击「添加」先创建空 section 再由 extedit 跳转过去）
@@ -40,8 +38,7 @@ s.create = function(self, section)
     local stat, err = TypedSection.create(self, section)
     if stat then
         luci.http.redirect(
-            luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit") ..
-            "?section=" .. section
+            luci.dispatcher.build_url("admin/services/m3u8mc/channel_edit", section)
         )
     end
     return stat, err
