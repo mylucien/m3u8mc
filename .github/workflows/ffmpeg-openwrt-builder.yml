@@ -1,0 +1,253 @@
+name: Build FFmpeg for OpenWrt (Static with GPL)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 1 * *'  # 每月1号自动编译
+
+env:
+  FFMPEG_VERSION: 8.0.1
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          yasm \
+          nasm \
+          pkg-config \
+          cmake \
+          git \
+          wget \
+          autoconf \
+          automake \
+          libtool \
+          zlib1g-dev \
+          libssl-dev \
+          libx11-dev \
+          libxext-dev \
+          libxfixes-dev \
+          libxcb1-dev \
+          libxcb-shm0-dev \
+          libxcb-xfixes0-dev \
+          libxcb-shape0-dev \
+          libdrm-dev \
+          libva-dev \
+          libvdpau-dev \
+          libasound2-dev \
+          libpulse-dev \
+          libv4l-dev \
+          libgl1-mesa-dev \
+          libegl1-mesa-dev \
+          libglvnd-dev \
+          libfreetype6-dev \
+          libfontconfig1-dev \
+          libass-dev \
+          libfribidi-dev \
+          libharfbuzz-dev \
+          libtheora-dev \
+          libvorbis-dev \
+          libogg-dev \
+          libvpx-dev \
+          libwebp-dev \
+          libx264-dev \
+          libx265-dev \
+          libxvidcore-dev \
+          libmp3lame-dev \
+          libopus-dev \
+          libxml2-dev \
+          libbluray-dev \
+          libbz2-dev \
+          libssh-dev \
+          libzmq3-dev \
+          libsoxr-dev \
+          libaom-dev \
+          libdav1d-dev \
+          libsvtav1-dev \
+          librav1e-dev \
+          libjxl-dev \
+          libplacebo-dev \
+          libshaderc-dev \
+          libopenmpt-dev \
+          libvidstab-dev \
+          libzimg-dev \
+          libvpl-dev \
+          lv2-dev \
+          liblilv-dev \
+          libgme-dev \
+          libgsm1-dev \
+          libopencore-amrnb-dev \
+          libopencore-amrwb-dev \
+          libvo-amrwbenc-dev \
+          libtwolame-dev \
+          libcaca-dev \
+          libcdio-dev \
+          libcdio-paranoia-dev \
+          libchromaprint-dev \
+          libcodec2-dev \
+          libflite1-dev \
+          libiec61883-dev \
+          libilbc-dev \
+          libjack-jackd2-dev \
+          libmodplug-dev \
+          libmp3lame-dev \
+          libopenal-dev \
+          libopencv-dev \
+          libopenjp2-7-dev \
+          libopenmpt-dev \
+          libopus-dev \
+          libpulse-dev \
+          librubberband-dev \
+          libsdl2-dev \
+          libshine-dev \
+          libsnappy-dev \
+          libspeex-dev \
+          libsrt-openssl-dev \
+          libtesseract-dev \
+          libtheora-dev \
+          libtwolame-dev \
+          libvdpau-dev \
+          libvorbis-dev \
+          libvpx-dev \
+          libwavpack-dev \
+          libwebp-dev \
+          libx264-dev \
+          libx265-dev \
+          libxvidcore-dev \
+          libzbar-dev \
+          libzmq3-dev \
+          libzvbi-dev
+
+    - name: Build FFmpeg (Static with full GPL support)
+      run: |
+        cd /tmp
+        
+        # 下载源码
+        wget -q https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz
+        tar -xf ffmpeg-${FFMPEG_VERSION}.tar.xz
+        cd ffmpeg-${FFMPEG_VERSION}
+        
+        # 完全静态编译，包含所有 GPL 功能
+        ./configure \
+          --prefix=/usr \
+          --disable-librtmp \
+          --disable-lzma \
+          --disable-stripping \
+          --enable-static \
+          --disable-shared \
+          --enable-avfilter \
+          --enable-gpl \
+          --enable-ladspa \
+          --enable-libaom \
+          --enable-libass \
+          --enable-libbluray \
+          --enable-libdav1d \
+          --enable-libdrm \
+          --enable-libfontconfig \
+          --enable-libfreetype \
+          --enable-libfribidi \
+          --enable-libharfbuzz \
+          --enable-libjxl \
+          --enable-libmp3lame \
+          --enable-libopenmpt \
+          --enable-libopus \
+          --enable-libplacebo \
+          --enable-libpulse \
+          --enable-librav1e \
+          --enable-librist \
+          --enable-libshaderc \
+          --enable-libsoxr \
+          --enable-libsrt \
+          --enable-libssh \
+          --enable-libtheora \
+          --enable-libv4l2 \
+          --enable-libvidstab \
+          --enable-libvorbis \
+          --enable-libvpx \
+          --enable-libwebp \
+          --enable-libx264 \
+          --enable-libx265 \
+          --enable-libxcb \
+          --enable-libxml2 \
+          --enable-libxvid \
+          --enable-libzimg \
+          --enable-libzmq \
+          --enable-lto=auto \
+          --enable-lv2 \
+          --enable-openssl \
+          --enable-pic \
+          --enable-pthreads \
+          --enable-vaapi \
+          --enable-vdpau \
+          --enable-version3 \
+          --enable-vulkan \
+          --optflags=-O3 \
+          --enable-libsvtav1 \
+          --enable-libvpl \
+          --extra-ldflags="-static -static-libgcc -static-libstdc++" \
+          --extra-cflags="-static -O3" \
+          --pkg-config-flags="--static"
+        
+        # 编译
+        make -j$(nproc)
+        
+        # 验证关键功能
+        echo "=== Checking GPL features ==="
+        ./ffmpeg -bsfs | grep h264_mp4toannexb && echo "✅ h264_mp4toannexb available" || echo "❌ Missing h264_mp4toannexb"
+        ./ffmpeg -bsfs | grep h264_metadata && echo "✅ h264_metadata available" || echo "❌ Missing h264_metadata"
+        ./ffmpeg -encoders | grep libx264 && echo "✅ libx264 available" || echo "❌ Missing libx264"
+        ./ffmpeg -decoders | grep h264 && echo "✅ H.264 decoder available" || echo "❌ Missing H.264 decoder"
+        
+        # 输出完整版本信息
+        ./ffmpeg -version
+        
+        # 复制产物
+        mkdir -p $GITHUB_WORKSPACE/artifacts
+        cp ./ffmpeg $GITHUB_WORKSPACE/artifacts/
+        cp ./ffprobe $GITHUB_WORKSPACE/artifacts/ 2>/dev/null || true
+        
+        # 显示文件信息
+        file $GITHUB_WORKSPACE/artifacts/ffmpeg
+        ls -lh $GITHUB_WORKSPACE/artifacts/
+
+    - name: Create version info
+      run: |
+        cd $GITHUB_WORKSPACE/artifacts
+        ./ffmpeg -version > version.txt
+        ./ffmpeg -buildconf >> version.txt
+        ./ffmpeg -bsfs | grep -E "h264|hevc|av1" >> version.txt
+        echo "Build date: $(date)" >> version.txt
+        
+        cat version.txt
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ffmpeg-openwrt-static-x86_64
+        path: |
+          ${{ github.workspace }}/artifacts/ffmpeg
+          ${{ github.workspace }}/artifacts/ffprobe
+          ${{ github.workspace }}/artifacts/version.txt
+        compression-level: 0
+
+    - name: Create Release (on tag)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          ${{ github.workspace }}/artifacts/ffmpeg
+          ${{ github.workspace }}/artifacts/ffprobe
+          ${{ github.workspace }}/artifacts/version.txt
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
