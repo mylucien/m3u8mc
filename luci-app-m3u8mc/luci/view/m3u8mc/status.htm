@@ -35,18 +35,125 @@
   <div id="mc-table-wrap"></div>
 </div>
 
-<script src="/luci-static/resources/m3u8mc-status.js"></script>
 <script>
-M3u8mcStatus.init({
-  statusUrl:  '/cgi-bin/luci/admin/services/m3u8mc/api/status',
-  actionUrl:  '/cgi-bin/luci/admin/services/m3u8mc/api/channel_action',
-  wrapId:     'm3u8mc-status-wrap',
-  uptimeId:   'mc-uptime',
-  tableId:    'mc-table-wrap',
-  errId:      'mc-err',
-  refreshTs:  'mc-refresh-ts',
-  interval:   4000
-});
+(function () {
+  /* ── 配置 ─────────────────────────────────────────────────── */
+  var STATUS_URL  = '<%=luci.dispatcher.build_url("admin/services/m3u8mc/api/status")%>';
+  var ACTION_URL  = '<%=luci.dispatcher.build_url("admin/services/m3u8mc/api/channel_action")%>';
+  var INTERVAL_MS = 4000;
+
+  /* ── 工具 ─────────────────────────────────────────────────── */
+  function $(id) { return document.getElementById(id); }
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function td(c)  { return '<td>' + (c == null ? '—' : c) + '</td>'; }
+  function th(l)  { return '<th>' + esc(l) + '</th>'; }
+  function pill(cond, label, style) {
+    var cls = style || (cond ? 'green' : 'red');
+    return '<td><span class="mc-pill mc-pill-' + cls + '">' + esc(label) + '</span></td>';
+  }
+  function fmtUp(s) {
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return (h ? h + ' 小时 ' : '') + (m ? m + ' 分 ' : '') + sec + ' 秒';
+  }
+  function showErr(msg) {
+    var el = $('mc-err');
+    if (!el) return;
+    if (msg) { el.textContent = msg; el.style.display = ''; }
+    else      { el.textContent = '';  el.style.display = 'none'; }
+  }
+
+  /* ── XHR（使用 luci dispatcher 生成的绝对路径，已含 stok）── */
+  function xhr(url, body, cb) {
+    var req = new XMLHttpRequest();
+    req.open(body ? 'POST' : 'GET', url, true);
+    if (body) req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    req.onreadystatechange = function () {
+      if (req.readyState !== 4) return;
+      if (req.status === 200) cb(null, req.responseText);
+      else cb('HTTP ' + req.status);
+    };
+    req.send(body || null);
+  }
+
+  /* ── 频道操作 ──────────────────────────────────────────────── */
+  function channelAction(action, name, btnEl) {
+    if (btnEl) btnEl.disabled = true;
+    xhr(ACTION_URL,
+        'action=' + encodeURIComponent(action) + '&name=' + encodeURIComponent(name),
+        function (err) {
+          if (err) alert('操作失败：' + err);
+          if (btnEl) btnEl.disabled = false;
+          setTimeout(refresh, 500);
+        });
+  }
+
+  /* ── 渲染 ──────────────────────────────────────────────────── */
+  function render(status) {
+    var uEl = $('mc-uptime');
+    if (uEl) uEl.textContent = '守护进程已运行 ' + fmtUp(status.uptime_secs || 0);
+
+    var tEl = $('mc-table-wrap');
+    if (!tEl) return;
+
+    var rows = (status.channels || []).map(function (ch) {
+      var btns = '';
+      if (ch.running) {
+        btns += '<button class="mc-act-btn" data-action="stop"    data-name="' + esc(ch.id) + '">停止</button>';
+        btns += '<button class="mc-act-btn" data-action="restart" data-name="' + esc(ch.id) + '">重启</button>';
+      } else {
+        btns += '<button class="mc-act-btn" data-action="start"   data-name="' + esc(ch.id) + '">启动</button>';
+      }
+      return '<tr>' +
+        td(esc(ch.id)) +
+        td(esc(ch.name)) +
+        pill(ch.enabled, ch.enabled ? '已启用' : '已禁用') +
+        pill(ch.running, ch.running ? '运行中' : '已停止') +
+        td(ch.mode === 'standard' ? '标准' : '直通') +
+        td(ch.cached_segments) +
+        td(ch.ffmpeg_pid ? ch.ffmpeg_pid : '—') +
+        td(ch.ffmpeg_restarts) +
+        pill(ch.overloaded, ch.overloaded ? '过载' : '正常', ch.overloaded ? 'yellow' : 'green') +
+        td('<a href="' + esc(ch.play_url) + '" style="font-size:0.8em">' + esc(ch.play_url) + '</a>') +
+        td(btns) +
+        '</tr>';
+    }).join('');
+
+    tEl.innerHTML =
+      '<table class="mc-table"><thead><tr>' +
+      th('ID') + th('频道名') + th('启用') + th('状态') +
+      th('模式') + th('缓存分片') + th('PID') + th('重启次数') +
+      th('背压') + th('组播地址') + th('操作') +
+      '</tr></thead><tbody>' +
+      (rows || '<tr><td colspan="11" style="text-align:center;color:#888">无频道运行</td></tr>') +
+      '</tbody></table>';
+
+    tEl.onclick = function (e) {
+      var btn = e.target;
+      if (!btn || btn.tagName !== 'BUTTON') return;
+      channelAction(btn.getAttribute('data-action'), btn.getAttribute('data-name'), btn);
+    };
+  }
+
+  /* ── 轮询 ──────────────────────────────────────────────────── */
+  function refresh() {
+    var ts = $('mc-refresh-ts');
+    if (ts) ts.textContent = '最后刷新：' + new Date().toLocaleTimeString();
+    xhr(STATUS_URL, null, function (err, text) {
+      if (err) { showErr('获取状态失败：' + err); return; }
+      showErr(null);
+      try { render(JSON.parse(text)); }
+      catch (e) { showErr('JSON 解析失败：' + e.message); }
+    });
+  }
+
+  refresh();
+  setInterval(refresh, INTERVAL_MS);
+}());
 </script>
 
 <%+footer%>
