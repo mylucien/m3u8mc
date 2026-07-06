@@ -22,14 +22,11 @@ function index()
     ce.leaf = true
     ce.i18n = false
 
-    entry({"admin", "services", "m3u8mc", "isolation"},
-          cbi("m3u8mc/isolation"), _("网络隔离"), 20)
-
-    entry({"admin", "services", "m3u8mc", "ffmpeg"},
-          template("m3u8mc/ffmpeg"), _("FFmpeg 管理"), 25)
-
     entry({"admin", "services", "m3u8mc", "status"},
-          template("m3u8mc/status"), _("运行状态"), 30)
+          template("m3u8mc/status"), _("运行状态"), 20)
+
+    entry({"admin", "services", "m3u8mc", "log"},
+          template("m3u8mc/log"), _("实时日志"), 30)
 
     -- Ajax 接口
     entry({"admin", "services", "m3u8mc", "api", "status"},
@@ -38,23 +35,11 @@ function index()
     entry({"admin", "services", "m3u8mc", "api", "channel_action"},
           call("api_channel_action")).leaf = true
 
-    entry({"admin", "services", "m3u8mc", "api", "isolation_apply"},
-          call("api_isolation_apply")).leaf = true
-
-    entry({"admin", "services", "m3u8mc", "api", "ffmpeg_check"},
-          call("api_ffmpeg_check")).leaf = true
-
-    entry({"admin", "services", "m3u8mc", "api", "ffmpeg_install"},
-          call("api_ffmpeg_install")).leaf = true
-
-    entry({"admin", "services", "m3u8mc", "api", "ffmpeg_progress"},
-          call("api_ffmpeg_progress")).leaf = true
-
-    entry({"admin", "services", "m3u8mc", "api", "ffmpeg_reset"},
-          call("api_ffmpeg_reset")).leaf = true
+    entry({"admin", "services", "m3u8mc", "api", "log"},
+          call("api_log")).leaf = true
 end
 
--- ── API handlers（原样保留）────────────────────────────────────
+-- ── API handlers ────────────────────────────────────────────
 
 function api_status()
     local http = require "luci.http"
@@ -104,121 +89,47 @@ function api_channel_action()
     end
 end
 
-function api_isolation_apply()
-    local http   = require "luci.http"
-    local sys    = require "luci.sys"
-    local action = http.formvalue("action") or ""
-    if action ~= "apply" and action ~= "revert" then
-        http.prepare_content("application/json")
-        http.write('{"error":"invalid action"}')
-        return
-    end
-    local out, code = sys.exec(
-        "/usr/share/m3u8mc/network-isolation.sh " .. action .. " 2>&1"
-    )
-    http.prepare_content("application/json")
-    if code == 0 then
-        http.write('{"ok":true}')
-    else
-        http.write(string.format('{"error":%q}', tostring(out)))
-    end
-end
-
-local FFMPEG_SCRIPT = "/usr/share/m3u8mc/ffmpeg-install.sh"
-local PROGRESS_FILE = "/tmp/m3u8mc-ffmpeg-install.progress"
-local LOCK_FILE     = "/tmp/m3u8mc-ffmpeg-install.lock"
-
-local ARCH_DEFAULTS_RAW = {
-    x86_64  = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
-    aarch64 = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz",
-    armv7l  = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-armhf-static.tar.xz",
-    i686    = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz",
-}
-
-local function get_download_url(arch, uci_cursor)
-    local uci_val = uci_cursor:get("m3u8mc", "global", "ffmpeg_download_url_" .. arch)
-    if uci_val and uci_val ~= "" then return uci_val end
-    return ARCH_DEFAULTS_RAW[arch] or ""
-end
-
-function api_ffmpeg_check()
+function api_log()
     local http = require "luci.http"
     local sys  = require "luci.sys"
     local uci  = require("luci.model.uci").cursor()
-    local custom_bin  = uci:get("m3u8mc", "global", "ffmpeg_bin") or ""
-    local check_target = custom_bin ~= "" and custom_bin or "ffmpeg"
-    local out  = sys.exec(string.format("%s check %q 2>&1", FFMPEG_SCRIPT, check_target))
-    local arch = (sys.exec("uname -m 2>/dev/null") or ""):gsub("%s+$", "")
-    local default_url = get_download_url(arch, uci)
-    http.prepare_content("application/json")
-    local body = (out or "{}"):gsub("%s+$", "")
-    if body:match("^{") and body:match("}$") then
-        body = body:sub(1, -2) ..
-               string.format(',"custom_bin":%q,"arch":%q,"default_url":%q}',
-                              custom_bin, arch, default_url)
-    else
-        body = string.format(
-            '{"found":false,"error":%q,"custom_bin":%q,"arch":%q,"default_url":%q}',
-            out or "check failed", custom_bin, arch, default_url)
-    end
-    http.write(body)
-end
 
-function api_ffmpeg_install()
-    local http = require "luci.http"
-    local sys  = require "luci.sys"
-    local url  = http.formvalue("url") or ""
-    http.prepare_content("application/json")
-    if url == "" then
-        http.write('{"error":"缺少下载地址"}')
-        return
-    end
-    if nixio.fs.access(LOCK_FILE) then
-        http.write('{"error":"已有安装任务在进行中，请稍候"}')
-        return
-    end
-    local f = io.open(PROGRESS_FILE, "w")
-    if f then f:write('{"progress":0,"msg":"排队中"}\n'); f:close() end
-    local cmd = string.format(
-        "( touch %q; " ..
-        "  if %s download %q >%q 2>&1; then %s set-uci /usr/local/bin/ffmpeg >>%q 2>&1; fi; " ..
-        "  rm -f %q " ..
-        ") &",
-        LOCK_FILE, FFMPEG_SCRIPT, url, PROGRESS_FILE,
-        FFMPEG_SCRIPT, PROGRESS_FILE, LOCK_FILE
+    -- 行数参数，限制 100–2000 防止请求过大
+    local lines_raw = http.formvalue("lines") or "200"
+    local lines = tonumber(lines_raw) or 200
+    if lines < 100  then lines = 100  end
+    if lines > 2000 then lines = 2000 end
+
+    -- 优先从 m3u8mcd 的 systemd/procd journal 读取；
+    -- immortalwrt 使用 logd，通过 logread 获取，再用 grep 过滤 m3u8mc 相关行。
+    -- 若 logread 不可用则 fallback 到 journalctl。
+    local out = ""
+
+    -- 尝试 logread（procd / OpenWrt / immortalwrt 默认）
+    local logread_out = sys.exec(
+        string.format("logread 2>/dev/null | grep -i 'm3u8m' | tail -n %d", lines)
     )
-    sys.call(cmd)
-    http.write('{"ok":true,"msg":"已开始下载安装"}')
-end
-
-function api_ffmpeg_progress()
-    local http = require "luci.http"
-    local fs   = nixio.fs
-    local running  = fs.access(LOCK_FILE)
-    local last_line = "{}"
-    if fs.access(PROGRESS_FILE) then
-        local content = fs.readfile(PROGRESS_FILE) or ""
-        for line in content:gmatch("[^\r\n]+") do
-            if line:match("^{") then last_line = line end
+    if logread_out and #logread_out > 10 then
+        out = logread_out
+    else
+        -- fallback: journalctl
+        local journal_out = sys.exec(
+            string.format(
+                "journalctl -u m3u8mcd --no-pager -n %d --output=short-iso 2>/dev/null",
+                lines
+            )
+        )
+        if journal_out and #journal_out > 10 then
+            out = journal_out
+        else
+            -- 最终 fallback：直接读 /var/log/m3u8mcd.log（若有）
+            local log_file = uci:get("m3u8mc", "global", "log_file") or ""
+            if log_file ~= "" and nixio.fs.access(log_file) then
+                out = sys.exec(string.format("tail -n %d %q 2>/dev/null", lines, log_file)) or ""
+            end
         end
     end
-    http.prepare_content("application/json")
-    if last_line:match("^{") and last_line:match("}$") then
-        http.write(last_line:sub(1, -2) ..
-                    string.format(',"running":%s}', running and "true" or "false"))
-    else
-        http.write(string.format('{"running":%s}', running and "true" or "false"))
-    end
-end
 
-function api_ffmpeg_reset()
-    local http = require "luci.http"
-    local sys  = require "luci.sys"
-    local out, code = sys.exec(string.format("%s reset-uci 2>&1", FFMPEG_SCRIPT))
-    http.prepare_content("application/json")
-    if code == 0 then
-        http.write('{"ok":true}')
-    else
-        http.write(string.format('{"error":%q}', tostring(out)))
-    end
+    http.prepare_content("text/plain; charset=utf-8")
+    http.write(out or "")
 end
