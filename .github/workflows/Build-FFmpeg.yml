@@ -4,214 +4,44 @@ on:
   workflow_dispatch:
     inputs:
       ffmpeg_version:
-        description: 'FFmpeg version tag (e.g. n8.0.1)'
+        description: 'FFmpeg version (e.g. 8.0.1)'
         required: true
-        default: 'n8.0.1'
+        default: '8.0.1'
 
 jobs:
-  build:
-    name: Build static ffmpeg (musl x86_64)
+  # ── 方案一：直接从 wader/static-ffmpeg 镜像提取（推荐，5 分钟内完成）────────
+  extract:
+    name: Extract from static-ffmpeg image
     runs-on: ubuntu-latest
-    container:
-      image: alpine:edge
-      options: --privileged
-
     steps:
-      - name: Install build dependencies
+      - name: Pull and extract static ffmpeg binary
         run: |
-          apk add --no-cache \
-            bash build-base pkgconf git nasm yasm python3 py3-pip \
-            cmake meson ninja samurai \
-            autoconf automake libtool gettext-dev \
-            curl wget tar xz \
-            # --- codec / filter libs (all static) ---
-            zlib-static bzip2-static xz-dev \
-            openssl-dev openssl-libs-static \
-            libpng-dev libpng-static \
-            freetype-dev freetype-static \
-            fontconfig-dev \
-            fribidi-dev fribidi-static \
-            harfbuzz-dev harfbuzz-static \
-            libass-dev libass-static \
-            libxml2-dev libxml2-static \
-            expat-dev expat-static \
-            brotli-dev brotli-static \
-            libjpeg-turbo-dev libjpeg-turbo-static \
-            libwebp-dev libwebp-static \
-            opus-dev opus-static \
-            libvorbis-dev libvorbis-static \
-            libtheora-dev libtheora-static \
-            lame-dev \
-            x264-dev x264-static \
-            x265-dev x265-static \
-            libvpx-dev \
-            dav1d-dev dav1d-static \
-            aom-dev aom-static \
-            soxr-dev soxr-static \
-            zimg-dev \
-            librist-dev \
-            srt-dev \
-            libssh-dev \
-            zeromq-dev zeromq-static \
-            flac-dev flac-static \
-            libsndfile-dev \
-            numactl-dev \
-            glib-dev glib-static \
-            pcre2-dev pcre2-dev \
-            libintl \
-            # --- muxing / container ---
-            libbluray-dev \
-            # --- svt-av1 (needs cmake build from source for static) ---
-            svt-av1-dev svt-av1-static \
-            # --- tools ---
-            xxd file
+          VERSION="${{ github.event.inputs.ffmpeg_version }}"
+          docker pull "mwader/static-ffmpeg:${VERSION}"
+          # 从镜像里把二进制复制出来
+          docker create --name ffmpeg_tmp "mwader/static-ffmpeg:${VERSION}"
+          docker cp ffmpeg_tmp:/ffmpeg  ./ffmpeg
+          docker cp ffmpeg_tmp:/ffprobe ./ffprobe
+          docker rm ffmpeg_tmp
 
-      # svt-av1 static lib may not be packaged; build from source if missing
-      - name: Check / build SVT-AV1 static lib
+      - name: Verify
         run: |
-          if [ ! -f /usr/lib/libSvtAv1Enc.a ]; then
-            echo "Building SVT-AV1 from source..."
-            git clone --depth=1 --branch v2.3.0 \
-              https://gitlab.com/AOMediaCodec/SVT-AV1.git /tmp/svt-av1
-            cmake -S /tmp/svt-av1 -B /tmp/svt-av1/build \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DCMAKE_INSTALL_PREFIX=/usr \
-              -DSVT_AV1_LTO=OFF
-            cmake --build /tmp/svt-av1/build --parallel $(nproc)
-            cmake --install /tmp/svt-av1/build
-          else
-            echo "SVT-AV1 static lib already present"
-          fi
-
-      # rav1e: ship a pre-built C API static lib (rav1e provides cbindgen crate)
-      - name: Install Rust + build rav1e
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          source "$HOME/.cargo/env"
-          cargo install --version 0.10.1 cargo-c
-          git clone --depth=1 --branch v0.10.1 \
-            https://github.com/xiph/rav1e.git /tmp/rav1e
-          cd /tmp/rav1e
-          cargo cinstall --release --prefix=/usr --library-type=staticlib
-          # ensure pkg-config finds it
-          pkg-config --exists rav1e && echo "rav1e OK" || echo "rav1e pkg-config missing, continuing"
-
-      - name: Checkout / download FFmpeg ${{ github.event.inputs.ffmpeg_version }}
-        run: |
-          wget -q \
-            "https://ffmpeg.org/releases/ffmpeg-8.0.1.tar.xz" \
-            -O /tmp/ffmpeg.tar.xz
-          # If the tag is not 8.0.1, swap the URL:
-          # https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${{ github.event.inputs.ffmpeg_version }}.tar.gz
-          mkdir -p /tmp/ffmpeg-src
-          tar -xf /tmp/ffmpeg.tar.xz --strip-components=1 -C /tmp/ffmpeg-src
-
-      - name: Configure FFmpeg (static, musl, x86_64)
-        working-directory: /tmp/ffmpeg-src
-        run: |
-          source "$HOME/.cargo/env" || true
-          ./configure \
-            --prefix=/tmp/ffmpeg-out \
-            --pkg-config-flags="--static" \
-            --extra-ldflags="-static" \
-            --extra-cflags="-Os" \
-            --enable-static \
-            --disable-shared \
-            --disable-debug \
-            --disable-doc \
-            --disable-htmlpages \
-            --disable-manpages \
-            --disable-podpages \
-            --disable-txtpages \
-            --disable-librtmp \
-            --disable-lzma \
-            --enable-gpl \
-            --enable-version3 \
-            --enable-nonfree \
-            --enable-pthreads \
-            --enable-pic \
-            --enable-avfilter \
-            --enable-openssl \
-            --enable-libx264 \
-            --enable-libx265 \
-            --enable-libvpx \
-            --enable-libvorbis \
-            --enable-libtheora \
-            --enable-libopus \
-            --enable-libmp3lame \
-            --enable-libass \
-            --enable-libfribidi \
-            --enable-libfreetype \
-            --enable-libfontconfig \
-            --enable-libharfbuzz \
-            --enable-libdav1d \
-            --enable-libaom \
-            --enable-libsvtav1 \
-            --enable-librav1e \
-            --enable-libwebp \
-            --enable-libxml2 \
-            --enable-libzimg \
-            --enable-libzmq \
-            --enable-libsoxr \
-            --enable-libsrt \
-            --enable-libssh \
-            --enable-librist \
-            --enable-libbluray \
-            --enable-libopenmpt \
-            --enable-libvidstab \
-            --enable-lv2 \
-            --enable-vaapi \
-            --enable-vulkan \
-            --enable-libshaderc \
-            --enable-libplacebo \
-            --enable-libvpl \
-            --disable-xlib \
-            --disable-libxcb \
-            --disable-libv4l2 \
-            --disable-libpulse \
-            --disable-vdpau \
-            2>&1 | tee /tmp/ffmpeg-configure.log
-          echo "--- configure exit: $?"
-
-      - name: Build FFmpeg
-        working-directory: /tmp/ffmpeg-src
-        run: |
-          make -j$(nproc) 2>&1 | tee /tmp/ffmpeg-build.log
-          make install
-
-      - name: Verify binary
-        run: |
-          BIN=/tmp/ffmpeg-out/bin/ffmpeg
           echo "=== file type ==="
-          file "$BIN"
+          file ffmpeg ffprobe
           echo "=== size ==="
-          ls -lh "$BIN"
-          echo "=== ldd (expect 'not a dynamic executable' or only ld-musl) ==="
-          ldd "$BIN" || true
+          ls -lh ffmpeg ffprobe
+          echo "=== ldd (must be 'statically linked') ==="
+          ldd ffmpeg || true
           echo "=== version ==="
-          "$BIN" -version
+          ./ffmpeg -version
           echo "=== buildconf ==="
-          "$BIN" -buildconf
+          ./ffmpeg -buildconf
 
-      - name: Strip binary
-        run: |
-          strip /tmp/ffmpeg-out/bin/ffmpeg
-          ls -lh /tmp/ffmpeg-out/bin/ffmpeg
-
-      - name: Upload ffmpeg binary
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-static-musl-x86_64
-          path: /tmp/ffmpeg-out/bin/ffmpeg
-          retention-days: 90
-
-      - name: Upload configure log (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ffmpeg-configure-log
+          name: ffmpeg-static-musl-x86_64-${{ github.event.inputs.ffmpeg_version }}
           path: |
-            /tmp/ffmpeg-configure.log
-            /tmp/ffmpeg-build.log
-          retention-days: 7
+            ffmpeg
+            ffprobe
+          retention-days: 90
