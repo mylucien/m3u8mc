@@ -5,7 +5,7 @@
 //! - 检测 sequence 异常回退（上游重启）并重置追踪基线；
 //! - media url 连续失败达到阈值后判定 token 失效，触发重新解析 master playlist。
 
-use super::downloader::{parse_headers, Downloader, SegmentTask};
+use super::downloader::{apply_proxy, parse_headers, Downloader, SegmentTask};
 use super::m3u8::{self, ParsedPlaylist};
 use super::mirror_pool::MirrorPool;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +30,9 @@ pub struct Poller {
     last_target_duration: Mutex<f32>,
     last_max_global_seq: AtomicU64,
     has_baseline: AtomicBool,
+    /// 用户显式配置的轮询间隔（秒）。> 0 时固定使用该值；
+    /// <= 0（未配置）时沿用旧的自适应逻辑：target_duration/2。
+    poll_interval_override: Option<Duration>,
 }
 
 impl Poller {
@@ -38,14 +41,21 @@ impl Poller {
         downloader: Arc<Downloader>,
         origin_urls: Vec<String>,
         http_headers: &[String],
+        poll_interval_secs: f32,
+        proxy: &str,
     ) -> Arc<Self> {
         let default_headers = parse_headers(http_headers);
+        let mut builder = reqwest::Client::builder()
+            .timeout(MEDIA_FETCH_TIMEOUT)
+            .default_headers(default_headers);
+        builder = apply_proxy(builder, proxy, "poller");
+        let poll_interval_override = if poll_interval_secs > 0.0 {
+            Some(Duration::from_secs_f32(poll_interval_secs))
+        } else {
+            None
+        };
         Arc::new(Poller {
-            client: reqwest::Client::builder()
-                .timeout(MEDIA_FETCH_TIMEOUT)
-                .default_headers(default_headers)
-                .build()
-                .expect("failed to build reqwest client"),
+            client: builder.build().expect("failed to build reqwest client"),
             mirror_pool,
             downloader,
             origin_urls,
@@ -53,6 +63,7 @@ impl Poller {
             last_target_duration: Mutex::new(6.0),
             last_max_global_seq: AtomicU64::new(0),
             has_baseline: AtomicBool::new(false),
+            poll_interval_override,
         })
     }
 
@@ -178,8 +189,14 @@ impl Poller {
                 }
             }
 
-            let poll_interval = (*self.last_target_duration.lock().unwrap() / 2.0).max(0.5);
-            if wait_or_stop(&mut stop_rx, Duration::from_secs_f32(poll_interval)).await {
+            let poll_interval = match self.poll_interval_override {
+                Some(fixed) => fixed,
+                None => {
+                    let secs = (*self.last_target_duration.lock().unwrap() / 2.0).max(0.5);
+                    Duration::from_secs_f32(secs)
+                }
+            };
+            if wait_or_stop(&mut stop_rx, poll_interval).await {
                 return;
             }
         }
