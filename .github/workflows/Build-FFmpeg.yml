@@ -1,11 +1,9 @@
-name: Build FFmpeg Static (Same as Container)
+name: Build FFmpeg Static (Ubuntu)
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:  # 支持手动触发
 
 env:
   FFMPEG_VERSION: 8.0.1
@@ -15,80 +13,83 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Build FFmpeg Static
+    - name: Install dependencies
       run: |
-        # 创建编译目录
-        mkdir -p $HOME/ffmpeg-build
-        cd $HOME/ffmpeg-build
-        
-        # 安装编译依赖（Alpine 风格）
         sudo apt-get update
         sudo apt-get install -y \
           build-essential \
           yasm \
           nasm \
           pkg-config \
-          libaom-dev \
-          libass-dev \
-          libbluray-dev \
-          libdav1d-dev \
+          cmake \
+          git \
+          wget \
+          autoconf \
+          automake \
+          libtool \
+          zlib1g-dev \
+          libssl-dev \
+          libx11-dev \
+          libxext-dev \
+          libxfixes-dev \
+          libxcb1-dev \
+          libxcb-shm0-dev \
+          libxcb-xfixes0-dev \
+          libxcb-shape0-dev \
           libdrm-dev \
-          libfontconfig-dev \
-          libfreetype-dev \
+          libva-dev \
+          libvdpau-dev \
+          libasound2-dev \
+          libpulse-dev \
+          libv4l-dev \
+          libgl1-mesa-dev \
+          libegl1-mesa-dev \
+          libglvnd-dev \
+          libfreetype6-dev \
+          libfontconfig1-dev \
+          libass-dev \
           libfribidi-dev \
           libharfbuzz-dev \
-          libjxl-dev \
-          libmp3lame-dev \
-          libopenmpt-dev \
-          libopus-dev \
-          libplacebo-dev \
-          libpulse-dev \
-          librav1e-dev \
-          librist-dev \
-          libshaderc-dev \
-          libsoxr-dev \
-          libsrt-dev \
-          libssh-dev \
           libtheora-dev \
-          libv4l-dev \
-          libvidstab-dev \
           libvorbis-dev \
+          libogg-dev \
           libvpx-dev \
           libwebp-dev \
           libx264-dev \
           libx265-dev \
-          libxcb-shm0-dev \
-          libxcb-xfixes0-dev \
-          libxml2-dev \
           libxvidcore-dev \
-          libzimg-dev \
+          libmp3lame-dev \
+          libopus-dev \
+          libxml2-dev \
+          libbluray-dev \
+          libbz2-dev \
+          libssh-dev \
+          libsrt-dev \
+          librist-dev \
           libzmq3-dev \
-          liblilv-dev \
-          libssl-dev \
-          libvulkan-dev \
-          libsvtav1enc-dev \
+          libsoxr-dev \
+          libaom-dev \
+          libdav1d-dev \
+          libsvtav1-dev \
+          librav1e-dev \
+          libjxl-dev \
+          libplacebo-dev \
+          libshaderc-dev \
+          libopenmpt-dev \
+          libvidstab-dev \
+          libzimg-dev \
           libvpl-dev \
-          libva-dev \
-          libvdpau-dev \
-          libasound2-dev \
-          libx11-dev \
-          libxext-dev \
-          libxfixes-dev \
-          libxcb-shape0-dev \
-          libxcb-xfixes0-dev \
-          libdrm-dev \
-          libgl-dev \
-          libegl-dev
-        
-        # 下载 FFmpeg 源码
+          lv2-dev \
+          liblilv-dev
+
+    - name: Download and build FFmpeg
+      run: |
+        cd /tmp
         wget -q https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz
         tar -xf ffmpeg-${FFMPEG_VERSION}.tar.xz
         cd ffmpeg-${FFMPEG_VERSION}
         
-        # 配置（与容器内完全一致，改为静态）
+        # 与容器内完全一致的配置
         ./configure \
           --prefix=/usr \
           --disable-librtmp \
@@ -148,34 +149,14 @@ jobs:
           --extra-ldflags="-static -static-libgcc -static-libstdc++" \
           --extra-cflags="-static"
         
-        # 编译
         make -j$(nproc)
         
-        # 检查产物
-        ls -lh ./ffmpeg
-        file ./ffmpeg
-        
-        # 复制到输出目录
         mkdir -p $GITHUB_WORKSPACE/artifacts
-        cp ./ffmpeg $GITHUB_WORKSPACE/artifacts/ffmpeg-static
-        cp ./ffprobe $GITHUB_WORKSPACE/artifacts/ffprobe-static 2>/dev/null || true
+        cp ./ffmpeg $GITHUB_WORKSPACE/artifacts/
+        cp ./ffprobe $GITHUB_WORKSPACE/artifacts/ 2>/dev/null || true
 
-    - name: Upload artifacts
+    - name: Upload
       uses: actions/upload-artifact@v4
       with:
         name: ffmpeg-static-x86_64
-        path: |
-          ${{ github.workspace }}/artifacts/ffmpeg-static
-          ${{ github.workspace }}/artifacts/ffprobe-static
-        compression-level: 0
-
-    - name: Create Release (on tag)
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          ${{ github.workspace }}/artifacts/ffmpeg-static
-          ${{ github.workspace }}/artifacts/ffprobe-static
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        path: artifacts/
