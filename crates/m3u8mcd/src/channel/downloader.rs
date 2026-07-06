@@ -46,8 +46,12 @@ pub struct Downloader {
     in_progress: Arc<DashSet<String>>,
     strategy: DownloadStrategy,
     threads: usize,
-    race_ips: Vec<String>,
-    /// media playlist 解析完成后由 Poller 动态写入，初始为 None。
+    /// 解析后的赛马候选：(IP/地址, 该候选专属的 Host 覆盖，未指定时为 None 走全局回退)。
+    race_targets: Vec<(String, Option<String>)>,
+    /// 全局默认赛马 Host（用户显式配置的 race_host，优先级低于候选自身指定的 host）。
+    configured_race_host: Option<String>,
+    /// media playlist 解析完成后由 Poller 动态写入的自动推断值，仅在
+    /// 候选没有指定专属 host、且 configured_race_host 为空时，才会作为最终兜底。
     /// 使用 RwLock 以便 Poller 和 Downloader 并发访问。
     race_host: RwLock<Option<String>>,
     // Bug 7 fix: 已删除 default_headers 死字段。
@@ -63,16 +67,24 @@ impl Downloader {
         strategy: DownloadStrategy,
         threads: usize,
         race_ips: Vec<String>,
+        race_host: &str,
         http_headers: &[String],
+        proxy: &str,
     ) -> Arc<Self> {
         let n_servers = mirror_pool.server_count().max(1);
         let permits = (n_servers * 3).max(6);
         let default_headers = parse_headers(http_headers);
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(WHOLE_DOWNLOAD_TIMEOUT)
-            .default_headers(default_headers.clone())
-            .build()
-            .expect("failed to build reqwest client");
+            .default_headers(default_headers.clone());
+        builder = apply_proxy(builder, proxy, "downloader");
+        let client = builder.build().expect("failed to build reqwest client");
+        let configured_race_host = if race_host.trim().is_empty() {
+            None
+        } else {
+            Some(race_host.trim().to_string())
+        };
+        let race_targets = race_ips.iter().map(|entry| parse_race_ip_entry(entry)).collect();
         Arc::new(Downloader {
             client,
             mirror_pool,
@@ -81,16 +93,30 @@ impl Downloader {
             in_progress: Arc::new(DashSet::new()),
             strategy,
             threads: threads.max(1),
-            race_ips,
+            race_targets,
+            configured_race_host,
             race_host: RwLock::new(None),
             overloaded: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// Poller 解析完 master playlist 后调用，更新 race_host 为 media URL 的 host。
-    /// 这样赛马模式向 race_ips 发请求时，Host 头携带的是分片所在域名而非 master 域名。
+    /// Poller 解析完 master playlist 后调用，更新自动推断的 race_host 为 media URL 的 host。
+    /// 仅当候选没有专属 host、且配置里也未显式指定 race_host 时，这个自动推断值才会被使用
+    /// （统一逻辑：标准模式与赛马模式都是"候选自带 > 显式配置 > 自动推断"）。
     pub fn set_race_host(&self, host: Option<String>) {
         *self.race_host.write().unwrap() = host;
+    }
+
+    /// 某个赛马候选实际使用的 Host：候选自带 host（`ip@host` 写法）优先，
+    /// 其次是全局显式配置的 race_host，最后兜底自动推断值。
+    fn effective_race_host(&self, per_target_host: &Option<String>) -> Option<String> {
+        if let Some(h) = per_target_host {
+            return Some(h.clone());
+        }
+        if let Some(h) = &self.configured_race_host {
+            return Some(h.clone());
+        }
+        self.race_host.read().unwrap().clone()
     }
 
     pub fn is_overloaded(&self) -> bool {
@@ -309,13 +335,14 @@ impl Downloader {
             .into_iter()
             .map(|s| (s, None))
             .collect();
-        for ip in &self.race_ips {
+        for (ip, per_target_host) in &self.race_targets {
             let base = if ip.starts_with("http://") || ip.starts_with("https://") {
                 ip.clone()
             } else {
                 format!("http://{ip}")
             };
-            candidates.push((base, self.race_host.read().unwrap().clone()));
+            let host = self.effective_race_host(per_target_host);
+            candidates.push((base, host));
         }
 
         if candidates.is_empty() {
@@ -361,6 +388,39 @@ impl Downloader {
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all race candidates failed")))
+    }
+}
+
+/// 若 proxy 非空，将其应用到 reqwest ClientBuilder 上（同时用于 http 和 https 请求）；
+/// 解析失败时记录 warn 并忽略，不影响客户端正常构建（回退为直连）。
+/// `label` 仅用于日志区分是 poller 还是 downloader 的代理配置。
+pub fn apply_proxy(builder: reqwest::ClientBuilder, proxy: &str, label: &str) -> reqwest::ClientBuilder {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return builder;
+    }
+    match reqwest::Proxy::all(proxy) {
+        Ok(p) => builder.proxy(p),
+        Err(e) => {
+            tracing::warn!(proxy, label, error = %e, "invalid proxy url, falling back to direct connection");
+            builder
+        }
+    }
+}
+
+/// 解析单条 race_ip 配置项，支持两种写法：
+/// - `1.2.3.4`：纯地址，不携带专属 host，后续按"全局 race_host → 自动推断"回退。
+/// - `1.2.3.4@mirror2.cdn.com`：地址携带专属 host，用于标准模式镜像池存在
+///   多个不同域名时，让每个赛马候选 IP 精确对应自己的域名，避免多域名场景下
+///   全部候选被套用同一个 Host 导致目标服务器认错域名。
+/// 地址部分本身若已经是 `http://` / `https://` 开头的完整 URL，`@host` 依然按最后一个
+/// `@` 切分（IPv6 裸地址不含 `@`，不会误切）。
+fn parse_race_ip_entry(entry: &str) -> (String, Option<String>) {
+    match entry.rsplit_once('@') {
+        Some((addr, host)) if !host.trim().is_empty() => {
+            (addr.trim().to_string(), Some(host.trim().to_string()))
+        }
+        _ => (entry.trim().to_string(), None),
     }
 }
 
@@ -415,5 +475,24 @@ mod tests {
         let abs = "https://other.cdn.com/seg100.ts";
         let result = Downloader::build_url("https://cdn.example.com/live", abs);
         assert_eq!(result, abs);
+    }
+
+    #[test]
+    fn parse_race_ip_entry_plain() {
+        assert_eq!(parse_race_ip_entry("1.2.3.4"), ("1.2.3.4".to_string(), None));
+    }
+
+    #[test]
+    fn parse_race_ip_entry_with_host() {
+        assert_eq!(
+            parse_race_ip_entry("1.2.3.4@mirror2.cdn.com"),
+            ("1.2.3.4".to_string(), Some("mirror2.cdn.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_race_ip_entry_trailing_at_ignored() {
+        // '@' 后面为空白，视为没有指定 host
+        assert_eq!(parse_race_ip_entry("1.2.3.4@ "), ("1.2.3.4".to_string(), None));
     }
 }
