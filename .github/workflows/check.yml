@@ -113,10 +113,9 @@ jobs:
           required_luci=(
             "luci-app-m3u8mc/luci/controller/m3u8mc.lua"
             "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channels.lua"
-            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/isolation.lua"
+            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channel_edit.lua"
             "luci-app-m3u8mc/luci/view/m3u8mc/status.htm"
-            "luci-app-m3u8mc/luci/view/m3u8mc/ffmpeg.htm"
-            "luci-app-m3u8mc/luci/htdocs/m3u8mc-status.js"
+            "luci-app-m3u8mc/luci/view/m3u8mc/log.htm"
           )
           for f in "${required_luci[@]}"; do
             if [ -f "$f" ]; then echo "$f"; else echo "::error file=$f::missing"; missing=$((missing+1)); fi
