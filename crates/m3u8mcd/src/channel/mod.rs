@@ -66,10 +66,19 @@ impl ChannelHandle {
             strategy,
             config.threads,
             config.race_ips.clone(),
-            &config.http_headers,
+            &config.race_host,
+            config.effective_downloader_headers(),
+            &config.download_proxy,
         );
 
-        let poller = Poller::new(Arc::clone(&mirror_pool), Arc::clone(&downloader), config.urls.clone(), &config.http_headers);
+        let poller = Poller::new(
+            Arc::clone(&mirror_pool),
+            Arc::clone(&downloader),
+            config.effective_list_urls().to_vec(),
+            config.effective_poller_headers(),
+            config.list_poll_interval_secs,
+            &config.list_proxy,
+        );
         let poller_handle = tokio::spawn(poller.run(stop_rx.clone()));
 
         let http_port = config.http_port.expect("standard mode requires http_port to be set");
