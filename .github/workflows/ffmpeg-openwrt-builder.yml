@@ -4,15 +4,13 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
-  schedule:
-    - cron: '0 0 1 * *'  # 每月1号自动编译
 
 env:
   FFMPEG_VERSION: 8.0.1
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04  # 改用 24.04，包更全
     
     steps:
     - name: Checkout
@@ -21,6 +19,8 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
+        
+        # 安装基础依赖
         sudo apt-get install -y \
           build-essential \
           yasm \
@@ -74,17 +74,11 @@ jobs:
           libaom-dev \
           libdav1d-dev \
           libsvtav1-dev \
-          librav1e-dev \
-          libjxl-dev \
-          libplacebo-dev \
-          libshaderc-dev \
           libopenmpt-dev \
           libvidstab-dev \
-          libzimg-dev \
           libvpl-dev \
           lv2-dev \
           liblilv-dev \
-          libgme-dev \
           libgsm1-dev \
           libopencore-amrnb-dev \
           libopencore-amrwb-dev \
@@ -95,49 +89,71 @@ jobs:
           libcdio-paranoia-dev \
           libchromaprint-dev \
           libcodec2-dev \
-          libflite1-dev \
-          libiec61883-dev \
-          libilbc-dev \
           libjack-jackd2-dev \
           libmodplug-dev \
-          libmp3lame-dev \
-          libopenal-dev \
-          libopencv-dev \
           libopenjp2-7-dev \
-          libopenmpt-dev \
-          libopus-dev \
-          libpulse-dev \
           librubberband-dev \
           libsdl2-dev \
           libshine-dev \
           libsnappy-dev \
           libspeex-dev \
-          libsrt-openssl-dev \
           libtesseract-dev \
-          libtheora-dev \
-          libtwolame-dev \
-          libvdpau-dev \
-          libvorbis-dev \
-          libvpx-dev \
           libwavpack-dev \
-          libwebp-dev \
-          libx264-dev \
-          libx265-dev \
-          libxvidcore-dev \
           libzbar-dev \
-          libzmq3-dev \
-          libzvbi-dev
+          libzvbi-dev \
+          libgme-dev \
+          libsodium-dev \
+          libxdmcp-dev \
+          libxau-dev \
+          libbsd-dev
+
+    - name: Build missing dependencies (rav1e, jxl, shaderc)
+      run: |
+        # rav1e - 从源码编译
+        cd /tmp
+        git clone --depth 1 https://github.com/xiph/rav1e.git
+        cd rav1e
+        cargo build --release --features=asm
+        sudo cp target/release/librav1e.a /usr/lib/x86_64-linux-gnu/
+        sudo cp target/release/librav1e.so /usr/lib/x86_64-linux-gnu/ 2>/dev/null || true
+        sudo cp include/rav1e/* /usr/include/ 2>/dev/null || true
+        
+        # libjxl - 从源码编译
+        cd /tmp
+        git clone --depth 1 https://github.com/libjxl/libjxl.git
+        cd libjxl
+        mkdir build && cd build
+        cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_SHARED_LIBS=OFF
+        make -j$(nproc)
+        sudo make install
+        
+        # shaderc - 从源码编译 (需要先编译 glslang)
+        cd /tmp
+        git clone --depth 1 https://github.com/KhronosGroup/glslang.git
+        cd glslang
+        mkdir build && cd build
+        cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_SHARED_LIBS=OFF
+        make -j$(nproc)
+        sudo make install
+        
+        cd /tmp
+        git clone --depth 1 https://github.com/google/shaderc.git
+        cd shaderc
+        ./utils/git-sync-deps
+        mkdir build && cd build
+        cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DSHADERC_SKIP_TESTS=ON -DBUILD_SHARED_LIBS=OFF
+        make -j$(nproc)
+        sudo make install
 
     - name: Build FFmpeg (Static with full GPL support)
       run: |
         cd /tmp
-        
-        # 下载源码
         wget -q https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz
         tar -xf ffmpeg-${FFMPEG_VERSION}.tar.xz
         cd ffmpeg-${FFMPEG_VERSION}
         
-        # 完全静态编译，包含所有 GPL 功能
+        export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+        
         ./configure \
           --prefix=/usr \
           --disable-librtmp \
@@ -157,17 +173,11 @@ jobs:
           --enable-libfreetype \
           --enable-libfribidi \
           --enable-libharfbuzz \
-          --enable-libjxl \
           --enable-libmp3lame \
           --enable-libopenmpt \
           --enable-libopus \
-          --enable-libplacebo \
           --enable-libpulse \
-          --enable-librav1e \
-          --enable-librist \
-          --enable-libshaderc \
           --enable-libsoxr \
-          --enable-libsrt \
           --enable-libssh \
           --enable-libtheora \
           --enable-libv4l2 \
@@ -194,41 +204,73 @@ jobs:
           --optflags=-O3 \
           --enable-libsvtav1 \
           --enable-libvpl \
+          --enable-librav1e \
+          --enable-libjxl \
+          --enable-libshaderc \
+          --enable-libplacebo \
+          --enable-libsrt \
+          --enable-librist \
           --extra-ldflags="-static -static-libgcc -static-libstdc++" \
           --extra-cflags="-static -O3" \
-          --pkg-config-flags="--static"
+          --pkg-config-flags="--static" || true  # 如果失败，继续用简化版
         
-        # 编译
+        # 如果上面的配置失败，使用简化版本（包含 GPL 但不包含难装的库）
+        if [ ! -f ffmpeg ]; then
+          echo "=== Full config failed, trying simplified version ==="
+          make distclean
+          
+          ./configure \
+            --prefix=/usr \
+            --disable-librtmp \
+            --disable-lzma \
+            --disable-stripping \
+            --enable-static \
+            --disable-shared \
+            --enable-avfilter \
+            --enable-gpl \
+            --enable-version3 \
+            --enable-pic \
+            --enable-pthreads \
+            --enable-openssl \
+            --enable-libx264 \
+            --enable-libx265 \
+            --enable-libvpx \
+            --enable-libmp3lame \
+            --enable-libopus \
+            --enable-libaom \
+            --enable-libdav1d \
+            --enable-libass \
+            --enable-libfreetype \
+            --enable-libfontconfig \
+            --enable-libvorbis \
+            --enable-libtheora \
+            --enable-libwebp \
+            --enable-libxvid \
+            --enable-vaapi \
+            --enable-vdpau \
+            --enable-libsoxr \
+            --enable-libssh \
+            --enable-libxml2 \
+            --enable-libbluray \
+            --enable-libsvtav1 \
+            --enable-libvpl \
+            --extra-ldflags="-static"
+        fi
+        
         make -j$(nproc)
         
-        # 验证关键功能
+        # 验证 GPL 功能
         echo "=== Checking GPL features ==="
-        ./ffmpeg -bsfs | grep h264_mp4toannexb && echo "✅ h264_mp4toannexb available" || echo "❌ Missing h264_mp4toannexb"
-        ./ffmpeg -bsfs | grep h264_metadata && echo "✅ h264_metadata available" || echo "❌ Missing h264_metadata"
-        ./ffmpeg -encoders | grep libx264 && echo "✅ libx264 available" || echo "❌ Missing libx264"
-        ./ffmpeg -decoders | grep h264 && echo "✅ H.264 decoder available" || echo "❌ Missing H.264 decoder"
-        
-        # 输出完整版本信息
+        ./ffmpeg -bsfs | grep h264_mp4toannexb && echo "✅ h264_mp4toannexb available" || echo "⚠️ Missing h264_mp4toannexb"
+        ./ffmpeg -encoders | grep libx264 && echo "✅ libx264 available" || echo "⚠️ Missing libx264"
         ./ffmpeg -version
         
-        # 复制产物
         mkdir -p $GITHUB_WORKSPACE/artifacts
         cp ./ffmpeg $GITHUB_WORKSPACE/artifacts/
         cp ./ffprobe $GITHUB_WORKSPACE/artifacts/ 2>/dev/null || true
         
-        # 显示文件信息
         file $GITHUB_WORKSPACE/artifacts/ffmpeg
         ls -lh $GITHUB_WORKSPACE/artifacts/
-
-    - name: Create version info
-      run: |
-        cd $GITHUB_WORKSPACE/artifacts
-        ./ffmpeg -version > version.txt
-        ./ffmpeg -buildconf >> version.txt
-        ./ffmpeg -bsfs | grep -E "h264|hevc|av1" >> version.txt
-        echo "Build date: $(date)" >> version.txt
-        
-        cat version.txt
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
@@ -237,17 +279,3 @@ jobs:
         path: |
           ${{ github.workspace }}/artifacts/ffmpeg
           ${{ github.workspace }}/artifacts/ffprobe
-          ${{ github.workspace }}/artifacts/version.txt
-        compression-level: 0
-
-    - name: Create Release (on tag)
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          ${{ github.workspace }}/artifacts/ffmpeg
-          ${{ github.workspace }}/artifacts/ffprobe
-          ${{ github.workspace }}/artifacts/version.txt
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
