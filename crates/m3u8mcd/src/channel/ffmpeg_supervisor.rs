@@ -119,7 +119,17 @@ impl FfmpegSupervisor {
             }
         }
 
-        cmd.arg("-f").arg("mpegts");
+        // muxer 必须跟协议匹配：
+        // - udp:// 输出用裸 mpegts（IPTV 组播的标准做法，不需要额外封装）
+        // - rtp:// 输出必须用 rtp_mpegts（专门给每个 RTP 包加 12 字节标准头、
+        //   按 7 个 TS 包一组打包），否则 ffmpeg 会把裸 TS 数据直接怼给 rtp://，
+        //   收不到合法 RTP 头，报 "Data doesn't look like RTP packets" 警告，
+        //   下游按标准 RTP 解析的设备/播放器会解析失败。
+        let output_format = match self.channel.protocol {
+            Protocol::Rtp => "rtp_mpegts",
+            Protocol::Udp => "mpegts",
+        };
+        cmd.arg("-f").arg(output_format);
         cmd.arg(self.output_url(local_ip));
 
         cmd.stdin(Stdio::null());
