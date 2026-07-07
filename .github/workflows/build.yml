@@ -5,9 +5,21 @@
 #     ├── m3u8mcd
 #     └── m3u8mcctl
 #
+# Job 依赖关系：
+#   build (matrix per target) ─┐
+#                               ├─> merge-bin (把各架构产物合并成单个 bin-all artifact)
+#                               │        │
+#                               │        ├─> release   (tag 触发，发布 tar.gz 到 GitHub Release)
+#                               │        └─> docker     (tag 触发，构建多架构镜像并推送到 GHCR)
+#
+# merge-bin 产出的 bin-all artifact 就是完整的 bin/<target-triple>/{m3u8mcd,m3u8mcctl}
+# 目录树，docker job 直接下载它作为构建上下文；以后新增 Dockerfile 时不需要再改这个
+# workflow 的编译/合并逻辑，只需要在仓库根目录放一个 Dockerfile 即可（见 docker job
+# 里的说明，Dockerfile 需要按 TARGETPLATFORM 从 bin/<target-triple>/ 里挑二进制）。
+#
 # 用法：
-#   1. git tag v0.1.0 并 push → 自动编译全部架构并发布到 Releases
-#   2. push 到 master → 仅编译 x86_64 + aarch64 快速验证
+#   1. git tag v0.1.0 并 push → 编译全部架构 + 发布 Release + 构建推送 Docker 镜像
+#   2. push 到 master / PR → 仅编译 x86_64 + aarch64 快速验证，不发布、不构建镜像
 #   3. 在 OpenWrt SDK 中：
 #        make package/m3u8mc/compile RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl
 #
@@ -30,8 +42,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Docker 镜像名，默认用 GHCR + 仓库名（小写）。以后想换成 Docker Hub 之类的，
+  # 改这里以及 docker job 里的 login 步骤即可，不用动其它 job。
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
+  # ── 交叉编译各架构二进制 ─────────────────────────────────────
   build:
     name: ${{ matrix.target }}
     runs-on: ubuntu-22.04
@@ -91,11 +107,44 @@ jobs:
           path: bin/${{ matrix.target }}/
           if-no-files-found: error
 
+  # ── 合并各架构产物成单个 bin-all artifact ────────────────────
+  # 独立出这一步是为了让 release 和 docker 两个 job 共用同一份已合并好的
+  # bin/<target-triple>/ 目录树，而不用各自重复下载/拼接 4 个 per-arch artifact。
+  merge-bin:
+    name: Merge binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: download-artifacts
+
+      - name: Assemble bin/<target-triple>/ tree
+        run: |
+          mkdir -p bin
+          for dir in download-artifacts/bin-*/; do
+            triple="${dir#download-artifacts/bin-}"
+            triple="${triple%/}"
+            mkdir -p "bin/${triple}"
+            cp -r "$dir"/* "bin/${triple}/"
+          done
+          echo "=== merged bin/ tree ==="
+          find bin -type f | sort
+
+      - name: Upload merged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-all
+          path: bin/
+          if-no-files-found: error
+
   # ── 合并产物并发布 Release（仅 tag 触发） ─────────────────────
   release:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
+    needs: [merge-bin]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -104,16 +153,17 @@ jobs:
       - name: Checkout (for openwrt-package files)
         uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download merged binaries
         uses: actions/download-artifact@v4
         with:
-          path: download-artifacts
+          name: bin-all
+          path: bin
 
       - name: Assemble release tarballs
         run: |
           # 每个架构单独打包，方便 OpenWrt Makefile 按 RUST_TARGET_TRIPLE 取用
-          for dir in download-artifacts/bin-*/; do
-            triple="${dir#download-artifacts/bin-}"
+          for dir in bin/*/; do
+            triple="${dir#bin/}"
             triple="${triple%/}"
             tarball="m3u8mc-${triple}.tar.gz"
             mkdir -p "dist/${triple}"
@@ -147,7 +197,60 @@ jobs:
             # 然后在 OpenWrt SDK 中编译 ipk
             RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl make package/m3u8mc/compile V=s
             ```
+
+            同版本的多架构 Docker 镜像见 `ghcr.io/${{ github.repository }}:${{ github.ref_name }}`。
           files: |
             m3u8mc-*.tar.gz
           draft: false
           prerelease: false
+
+  # ── 构建并推送多架构 Docker 镜像（仅 tag 触发） ────────────────
+  # 用仓库根目录的 Dockerfile（alpine 基础镜像），从 merge-bin 产出的
+  # bin/<target-triple>/ 里按 TARGETPLATFORM 挑对应架构的 m3u8mcd / m3u8mcctl
+  # 直接 COPY 进镜像，不在容器里现场编译。跟 release job 一样由同一个 tag push
+  # 触发，一次 `git push --tags` 就会同时发布 GitHub Release 和 Docker 镜像。
+  docker:
+    name: Build & push Docker image
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [merge-bin]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download merged binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-all
+          path: bin
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_NAME }}:latest
