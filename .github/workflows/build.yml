@@ -17,6 +17,12 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [master]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "版本号（如 v0.1.0），自动打 tag 并触发完整发布流程"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -88,6 +94,8 @@ jobs:
     if: always()
     needs: [build]
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - name: Check build results
         run: |
@@ -98,16 +106,49 @@ jobs:
           fi
           echo "All build matrix jobs succeeded"
 
+      - name: Create and push tag (手动触发时)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::版本号格式错误，应为 vX.Y.Z，收到：$tag"
+            exit 1
+          fi
+          if git ls-remote --tags origin "$tag" | grep -q "$tag"; then
+            echo "::error::tag $tag 已存在"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$tag"
+          git push origin "$tag"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+
   # ── 发布 Release（仅 tag 触发） ───────────────────────────────
   release:
     name: Create Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: [build-complete]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
 
     steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -126,8 +167,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: m3u8mc ${{ github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: m3u8mc ${{ steps.tag.outputs.value }}
           body: |
             预编译二进制包，配合 OpenWrt `openwrt-package/Makefile` 使用。
 
@@ -146,7 +187,7 @@ jobs:
             RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl make package/m3u8mc/compile V=s
             ```
 
-            Docker 镜像：`ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
+            Docker 镜像：`ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.value }}`
           files: m3u8mc-*.tar.gz
           draft: false
           prerelease: false
@@ -154,7 +195,7 @@ jobs:
   # ── 构建并推送多架构 Docker 镜像（仅 tag 触发） ────────────────
   docker:
     name: Build & push Docker image
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: [build-complete]
     runs-on: ubuntu-22.04
     permissions:
@@ -195,7 +236,13 @@ jobs:
 
       - name: Extract version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "value=${tag#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -204,5 +251,5 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}
             ${{ env.IMAGE_NAME }}:latest
