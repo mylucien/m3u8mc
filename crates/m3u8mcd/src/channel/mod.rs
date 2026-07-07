@@ -156,7 +156,7 @@ impl ChannelHandle {
     pub fn status(&self) -> ChannelStatus {
         let mode = if self.config.use_downloader { "standard" } else { "passthrough" };
         let cached_segments = self.cache.as_ref().map(|c| c.len()).unwrap_or(0);
-        let active_server = self.mirror_pool.as_ref().and_then(|p| p.next_server());
+        let active_server = self.mirror_pool.as_ref().and_then(|p| p.peek_next_server());
         let overloaded = self.downloader.as_ref().map(|d| d.is_overloaded()).unwrap_or(false);
         let running = self.ffmpeg_status.running.load(Ordering::Relaxed);
         let pid = self.ffmpeg_status.pid.load(Ordering::Relaxed);
@@ -178,10 +178,10 @@ impl ChannelHandle {
     }
 }
 
+/// 统一 http_path 归一化：保证有且仅有一个前导 '/'，且没有尾部 '/'，
+/// 与 http_server.rs 里注册路由时的 trim 逻辑保持一致，
+/// 避免 ffmpeg 实际请求的 URL 与内部 HTTP server 注册的路由不匹配（尤其是配置了
+/// 带尾斜杠的 http_path，如 '/live/'，导致 playlist.m3u8 前出现双斜杠）。
 fn normalize_path(p: &str) -> String {
-    if p.starts_with('/') {
-        p.to_string()
-    } else {
-        format!("/{p}")
-    }
+    format!("/{}", p.trim_matches('/'))
 }

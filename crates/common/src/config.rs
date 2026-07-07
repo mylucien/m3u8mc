@@ -1,6 +1,6 @@
 //! 内部配置模型：从 [`crate::uci::UciConfig`] 翻译而来的强类型结构。
 //!
-//! 对应设计文档 2.2 节 schema：global / channel / vlan_isolation 三类 section。
+//! 对应设计文档 2.2 节 schema：global / channel 两类 section。
 
 use crate::uci::UciConfig;
 use serde::{Deserialize, Serialize};
@@ -115,19 +115,9 @@ impl ChannelConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VlanIsolationConfig {
-    pub enabled: bool,
-    pub base_device: String,
-    pub vlan_id: u16,
-    pub ipaddr: String,
-    pub netmask: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub global: GlobalConfig,
     pub channels: Vec<ChannelConfig>,
-    pub vlan_isolation: Option<VlanIsolationConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -257,18 +247,9 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
         channels.push(channel);
     }
 
-    let vlan_isolation = uci.first_of("vlan_isolation").map(|sec| VlanIsolationConfig {
-        enabled: sec.get_bool("enabled", false),
-        base_device: sec.get_or("base_device", "br-lan"),
-        vlan_id: sec.get_parsed("vlan_id", 100u16),
-        ipaddr: sec.get_or("ipaddr", "10.10.100.1"),
-        netmask: sec.get_or("netmask", "255.255.255.0"),
-    });
-
     Ok(Config {
         global,
         channels,
-        vlan_isolation,
     })
 }
 

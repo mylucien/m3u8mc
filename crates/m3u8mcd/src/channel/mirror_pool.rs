@@ -80,13 +80,25 @@ impl MirrorPool {
         }
     }
 
-    /// 轮询取下一台可用服务器（标准模式 primary 选择）。
+    /// 轮询取下一台可用服务器（标准模式 primary 选择）。会推进轮询游标，
+    /// 仅供 Downloader 实际下载时调用；只读展示场景请用 [`Self::peek_next_server`]。
     pub fn next_server(&self) -> Option<String> {
         let avail = self.available_servers();
         if avail.is_empty() {
             return None;
         }
         let idx = self.rr_cursor.fetch_add(1, Ordering::Relaxed) % avail.len();
+        Some(avail[idx].clone())
+    }
+
+    /// 只读地查看"下一个将被使用的服务器"，不推进轮询游标。
+    /// 供 status 等只读查询场景使用，避免频繁查询状态干扰真实下载的轮询顺序。
+    pub fn peek_next_server(&self) -> Option<String> {
+        let avail = self.available_servers();
+        if avail.is_empty() {
+            return None;
+        }
+        let idx = self.rr_cursor.load(Ordering::Relaxed) % avail.len();
         Some(avail[idx].clone())
     }
 

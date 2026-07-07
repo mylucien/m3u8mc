@@ -68,5 +68,9 @@ async fn dispatch(req: Request, manager: &Arc<ChannelManager>) -> Response {
             Ok(()) => Response::Ok,
             Err(e) => Response::Error { message: e.to_string() },
         },
+        Request::StopAll => {
+            manager.shutdown_all().await;
+            Response::Ok
+        }
     }
 }

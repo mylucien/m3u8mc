@@ -32,15 +32,22 @@ impl ChannelManager {
         config.global.ffmpeg_bin.clone()
     }
 
-    pub async fn load_initial(&self, config: Config) {
+    /// 加载启动时的初始配置。`start_channels` 对应 `global.enabled`：
+    /// 为 false 时（daemon 整体idle）仍然把 config 写入 current_config，
+    /// 只是不拉起任何频道任务——这样即使 global.enabled=0，
+    /// 通过控制 socket 手动 `channel_start` 单个频道时也能在 current_config
+    /// 里正确找到它，不需要先手动 reload 一次。
+    pub async fn load_initial(&self, config: Config, start_channels: bool) {
         let ffmpeg_bin = Self::ffmpeg_bin(&config);
-        let mut channels = self.channels.write().await;
-        for ch in config.channels.iter().filter(|c| c.enabled) {
-            tracing::info!(channel = %ch.id, ffmpeg_bin = %ffmpeg_bin, "starting channel");
-            channels.insert(
-                ch.id.clone(),
-                ChannelHandle::spawn(ch.clone(), ffmpeg_bin.clone()),
-            );
+        if start_channels {
+            let mut channels = self.channels.write().await;
+            for ch in config.channels.iter().filter(|c| c.enabled) {
+                tracing::info!(channel = %ch.id, ffmpeg_bin = %ffmpeg_bin, "starting channel");
+                channels.insert(
+                    ch.id.clone(),
+                    ChannelHandle::spawn(ch.clone(), ffmpeg_bin.clone()),
+                );
+            }
         }
         *self.current_config.write().await = config;
     }
@@ -114,6 +121,12 @@ impl ChannelManager {
             .find(|c| c.id == name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("channel '{name}' not found in config"))?;
+        if !ch_cfg.enabled {
+            anyhow::bail!(
+                "channel '{name}' is disabled in config (enabled=0); \
+                 set 'option enabled 1' and reload before starting it"
+            );
+        }
         let ffmpeg_bin = Self::ffmpeg_bin(&cfg);
         drop(cfg);
 

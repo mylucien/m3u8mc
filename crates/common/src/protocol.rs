@@ -13,6 +13,8 @@ pub enum Request {
     ChannelStart { name: String },
     ChannelStop { name: String },
     ChannelRestart { name: String },
+    /// 停止所有正在运行的频道（daemon 进程本身继续存活，channels map 清空）。
+    StopAll,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -35,9 +35,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(channels = parsed.channels.len(), "loaded configuration");
 
     let manager = ChannelManager::new(args.config.to_string_lossy().to_string());
-    if parsed.global.enabled {
-        manager.load_initial(parsed.clone()).await;
-    }
+    // 无论 global.enabled 是否为 true，都要把解析好的配置写入 current_config，
+    // 否则 global.enabled=0 时手动 channel_start 会因为 current_config 是空的
+    // Config::default() 而报"channel not found in config"。
+    manager.load_initial(parsed.clone(), parsed.global.enabled).await;
 
     let control_socket = parsed.global.control_socket.clone();
     let manager_for_control = manager.clone();

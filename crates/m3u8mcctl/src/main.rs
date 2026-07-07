@@ -77,11 +77,11 @@ async fn main() -> anyhow::Result<()> {
             println!("reload ok");
         }
         Command::StopAll => {
-            // daemon 当前没有专门的 stop-all 指令，逐个频道 stop 由 init 脚本结合
-            // status 列表完成；这里直接尝试调用一次 reload 语义之外的占位实现：
-            // 实际生产中 stop-all 应由 procd 直接 kill daemon 进程完成，
-            // 该子命令保留用于未来扩展（如优雅关闭前的清理钩子）。
-            println!("stop-all: daemon process termination is handled by procd respawn/stop, no-op here");
+            // 停止 daemon 内所有正在运行的频道任务（ffmpeg 进程等），
+            // daemon 进程本身继续存活，channels map 清空；
+            // 后续可通过 reload 或 channel start 重新拉起。
+            expect_ok(send(&args.socket, Request::StopAll).await?)?;
+            println!("stop-all ok: all running channels have been stopped");
         }
         Command::Channel { action } => {
             let req = match action {

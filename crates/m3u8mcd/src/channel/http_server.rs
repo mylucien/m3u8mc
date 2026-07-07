@@ -30,19 +30,18 @@ pub async fn serve(
     port: u16,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let path = if http_path.starts_with('/') {
-        http_path.clone()
-    } else {
-        format!("/{http_path}")
-    };
+    // 与 channel/mod.rs 里 normalize_path 保持完全一致的归一化逻辑：
+    // 保证有且仅有一个前导 '/'，且没有尾部 '/'，避免 ffmpeg 实际请求的 URL
+    // 与这里注册的路由因为斜杠数量不一致而对不上（例如 http_path 配了 '/live/'）。
+    let path = format!("/{}", http_path.trim_matches('/'));
     let state = ServerState {
         cache,
         hls_segments,
     };
 
-    let playlist_route = format!("{}/playlist.m3u8", path.trim_end_matches('/'));
-    let segment_route = format!("{}/seg/:seq", path.trim_end_matches('/'));
-    let stream_route = format!("{}/stream.ts", path.trim_end_matches('/'));
+    let playlist_route = format!("{path}/playlist.m3u8");
+    let segment_route = format!("{path}/seg/:seq");
+    let stream_route = format!("{path}/stream.ts");
 
     let app = Router::new()
         .route(&playlist_route, get(playlist_handler))
