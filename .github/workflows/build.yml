@@ -60,7 +60,7 @@ jobs:
   # 那次新的 run 才会走 build → merge-bin → release → docker 的完整流程。
   auto-tag:
     name: Create & push tag
-    if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -72,7 +72,7 @@ jobs:
 
       - name: Validate version format
         run: |
-          v="${{ inputs.version }}"
+          v="${{ github.event.inputs.version }}"
           if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::version 格式不对，应为形如 1.2.3 的 X.Y.Z（不要带 v 前缀）：收到 '$v'"
             exit 1
@@ -80,7 +80,7 @@ jobs:
 
       - name: Create and push tag
         run: |
-          tag="v${{ inputs.version }}"
+          tag="v${{ github.event.inputs.version }}"
           if git rev-parse "$tag" >/dev/null 2>&1; then
             echo "::error::tag $tag 已经存在，换一个版本号"
             exit 1
@@ -95,7 +95,7 @@ jobs:
     name: ${{ matrix.target }}
     # 手动运行且填了 version 时，这次 run 只走上面 auto-tag 打 tag，
     # 不在这里重复编译一遍——真正的编译会在 tag push 触发的新 run 里跑。
-    if: "!(github.event_name == 'workflow_dispatch' && inputs.version != '')"
+    if: "!(github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')"
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
