@@ -80,11 +80,29 @@ jobs:
           path: bin/${{ matrix.target }}/
           if-no-files-found: error
 
+  # ── 汇聚 matrix 结果（解决 matrix skip 导致下游被误判为 skipped 的问题） ──
+  # GitHub Actions 的坑：matrix job 被 if 过滤掉时，needs 它的下游 job 也会被 skip。
+  # 用一个独立的 fan-in job + always() 显式检查，让 release / docker 只需 needs 这一个 job。
+  build-complete:
+    name: Build complete
+    if: always()
+    needs: [build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check build results
+        run: |
+          result="${{ needs.build.result }}"
+          if [[ "$result" != "success" ]]; then
+            echo "::error::build matrix 结果为 $result，中止后续发布"
+            exit 1
+          fi
+          echo "All build matrix jobs succeeded"
+
   # ── 发布 Release（仅 tag 触发） ───────────────────────────────
   release:
     name: Create Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.build-complete.result == 'success'
+    needs: [build-complete]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -136,8 +154,8 @@ jobs:
   # ── 构建并推送多架构 Docker 镜像（仅 tag 触发） ────────────────
   docker:
     name: Build & push Docker image
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.build-complete.result == 'success'
+    needs: [build-complete]
     runs-on: ubuntu-22.04
     permissions:
       contents: read
