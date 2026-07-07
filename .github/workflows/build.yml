@@ -101,7 +101,7 @@ jobs:
   # ── 发布 Release（仅 tag 触发） ───────────────────────────────
   release:
     name: Create Release
-    if: startsWith(github.ref, 'refs/tags/v') && needs.build-complete.result == 'success'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-complete]
     runs-on: ubuntu-22.04
     permissions:
@@ -154,7 +154,7 @@ jobs:
   # ── 构建并推送多架构 Docker 镜像（仅 tag 触发） ────────────────
   docker:
     name: Build & push Docker image
-    if: startsWith(github.ref, 'refs/tags/v') && needs.build-complete.result == 'success'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-complete]
     runs-on: ubuntu-22.04
     permissions:
