@@ -6,6 +6,8 @@
 #     └── m3u8mcctl
 #
 # Job 依赖关系：
+#   auto-tag (仅手动运行且填了 version 时执行，打 tag 并 push，触发下面的正式流程)
+#
 #   build (matrix per target) ─┐
 #                               ├─> merge-bin (把各架构产物合并成单个 bin-all artifact)
 #                               │        │
@@ -13,14 +15,15 @@
 #                               │        └─> docker     (tag 触发，构建多架构镜像并推送到 GHCR)
 #
 # merge-bin 产出的 bin-all artifact 就是完整的 bin/<target-triple>/{m3u8mcd,m3u8mcctl}
-# 目录树，docker job 直接下载它作为构建上下文；以后新增 Dockerfile 时不需要再改这个
-# workflow 的编译/合并逻辑，只需要在仓库根目录放一个 Dockerfile 即可（见 docker job
-# 里的说明，Dockerfile 需要按 TARGETPLATFORM 从 bin/<target-triple>/ 里挑二进制）。
+# 目录树，docker job 直接下载它作为构建上下文。
 #
 # 用法：
 #   1. git tag v0.1.0 并 push → 编译全部架构 + 发布 Release + 构建推送 Docker 镜像
 #   2. push 到 master / PR → 仅编译 x86_64 + aarch64 快速验证，不发布、不构建镜像
-#   3. 在 OpenWrt SDK 中：
+#   3. 在 Actions 页面手动 Run workflow，填写 version 输入框（如 0.1.0）
+#      → 自动帮你打 tag v0.1.0 并 push，随后自动触发一次新的 run 走完整发布流程；
+#      不填 version 手动运行则等价于用法 2，只快速编译验证
+#   4. 在 OpenWrt SDK 中：
 #        make package/m3u8mc/compile RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl
 #
 # 依赖：cargo-zigbuild（zig 链接器，静态 musl 编译）
@@ -35,8 +38,12 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      version:
+        description: "填版本号（如 0.1.0）会自动 git tag vX.Y.Z 并 push，触发完整发布流程；留空则只做快速编译验证，不发布"
+        required: false
+        type: string
       targets:
-        description: "编译目标（逗号分隔，为空则编译全部）"
+        description: "编译目标（逗号分隔，为空则编译全部，仅在不填 version 的快速验证场景下生效）"
         required: false
         type: string
 
@@ -47,9 +54,48 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
+  # ── 手动触发 + 填了 version 输入框时：自动打 tag 并 push ──────
+  # 只负责创建 tag，不编译。push tag 这个动作本身会自动触发一次新的
+  # workflow run（跟你在本地敲 git push origin vX.Y.Z 效果一样），
+  # 那次新的 run 才会走 build → merge-bin → release → docker 的完整流程。
+  auto-tag:
+    name: Create & push tag
+    if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version format
+        run: |
+          v="${{ inputs.version }}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version 格式不对，应为形如 1.2.3 的 X.Y.Z（不要带 v 前缀）：收到 '$v'"
+            exit 1
+          fi
+
+      - name: Create and push tag
+        run: |
+          tag="v${{ inputs.version }}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "::error::tag $tag 已经存在，换一个版本号"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$tag"
+          git push origin "$tag"
+          echo "已创建并推送 tag: $tag，稍后会自动触发一次新的 workflow run 完成编译、发布 Release 与 Docker 镜像"
   # ── 交叉编译各架构二进制 ─────────────────────────────────────
   build:
     name: ${{ matrix.target }}
+    # 手动运行且填了 version 时，这次 run 只走上面 auto-tag 打 tag，
+    # 不在这里重复编译一遍——真正的编译会在 tag push 触发的新 run 里跑。
+    if: "!(github.event_name == 'workflow_dispatch' && inputs.version != '')"
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
