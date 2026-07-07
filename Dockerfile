@@ -4,17 +4,18 @@
 # 不在容器里现场编译。
 #
 # ffmpeg 策略：
-#   linux/amd64  → 使用仓库内备份的 ffmpeg-bundle.tar.gz（musl 版，排除 ld-musl）
+#   linux/amd64  → 使用 Release 里备份的 ffmpeg-bundle.tar.gz（musl 版，排除 ld-musl）
 #   其他架构     → apk add ffmpeg
 
 FROM alpine:3.22
 ARG TARGETPLATFORM
 
-COPY ffmpeg-bundle.tar.gz /tmp/ffmpeg-bundle.tar.gz
-
 RUN set -eu; \
+    apk add --no-cache ca-certificates wget; \
     case "$TARGETPLATFORM" in \
         "linux/amd64") \
+            wget -q -O /tmp/ffmpeg-bundle.tar.gz \
+                "https://github.com/mylucien/m3u8mc/releases/download/v0.1.0/ffmpeg-bundle.tar.gz"; \
             mkdir -p /tmp/ffmpeg-bundle; \
             tar -xzf /tmp/ffmpeg-bundle.tar.gz -C /tmp/ffmpeg-bundle; \
             cp /tmp/ffmpeg-bundle/bin/ffmpeg  /usr/local/bin/ffmpeg; \
@@ -28,7 +29,6 @@ RUN set -eu; \
             apk add --no-cache ffmpeg; \
             ;; \
     esac; \
-    apk add --no-cache ca-certificates; \
     rm -rf /tmp/ffmpeg-bundle.tar.gz /tmp/ffmpeg-bundle
 
 COPY bin/ /tmp/bin/
