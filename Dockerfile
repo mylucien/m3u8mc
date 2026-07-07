@@ -15,7 +15,7 @@ RUN set -eu; \
     case "$TARGETPLATFORM" in \
         "linux/amd64") \
             wget -q -O /tmp/ffmpeg-bundle.tar.gz \
-                "https://github.com/mylucien/m3u8mc/releases/download/v0.1.0/ffmpeg-bundle.tar.gz"; \
+                "https://github.com/mylucien/lucien/releases/download/v1.0.0/ffmpeg-bundle.tar.gz"; \
             mkdir -p /tmp/ffmpeg-bundle; \
             tar -xzf /tmp/ffmpeg-bundle.tar.gz -C /tmp/ffmpeg-bundle; \
             cp /tmp/ffmpeg-bundle/bin/ffmpeg  /usr/local/bin/ffmpeg; \
