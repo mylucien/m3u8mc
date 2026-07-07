@@ -1,167 +1,262 @@
-# m3u8mc — m3u8 转组播 OpenWrt 插件
+1. 项目简介
 
-将 HTTP 单播 m3u8 直播源（支持多镜像）拉流、缓存，转换为 UDP/RTP 组播推送至局域网设备
+m3u8mc 是一个将 HLS（m3u8）直播源转换为组播/UDP 流的守护进程，主要用于 OpenWrt 路由器或 Linux 服务器场景。容器镜像内置 ffmpeg，无需在宿主机单独安装，开箱即用。
 
-## 架构
+核心组件：
 
-```
-上游 m3u8 源 (多镜像)
-      │
-      ▼
-  Poller (轮询检测新分片)
-      │
-      ▼
-Downloader Pool
-  ├─ RoundRobin 标准模式 (HEAD探测→Range分块→失败回退整体，跨镜像换台)
-  └─ Race 赛马模式 (多镜像并发竞速取最快)
-      │
-      ▼
-  SegmentCache (内存分片缓存，双重淘汰策略)
-      │
-      ├──► InternalHttpServer (HLS + TS 字节流，对 ffmpeg 内部可见)
-      │         │
-      │         ▼
-      │     FfmpegSupervisor (监控/重启 ffmpeg)
-      │         │
-      │         ▼
-      │    UDP/RTP 组播 (239.x.x.x)
-      │
-      └──► [直通模式] ffmpeg 直接拉上游 m3u8
 
-控制面：Unix Domain Socket ← m3u8mcctl / LuCI / init 脚本
-```
+m3u8mcd：主守护进程，负责拉取 m3u8 列表、缓存 TS 分片、通过 ffmpeg 转推组播/UDP，同时提供内置 HTTP 服务供 HLS 回放
+m3u8mcctl：命令行控制工具，通过 Unix Socket 与 daemon 通信，用于查看状态、热重载配置、启停频道
 
-## 目录结构
 
-```
-m3u8mc/
-├── Cargo.toml                    # workspace 根
-├── build.sh                      # 交叉编译脚本
-├── crates/
-│   ├── common/                   # 共享库：UCI 解析、类型化配置、控制协议
-│   │   └── src/
-│   │       ├── uci.rs            # 轻量 UCI 文本解析器（无 libuci 依赖）
-│   │       ├── config.rs         # 强类型配置结构 + 从 UCI 翻译 + diff
-│   │       └── protocol.rs       # daemon ↔ ctl 控制协议（ndjson over UDS）
-│   │
-│   ├── m3u8mcd/                  # 核心 daemon
-│   │   └── src/
-│   │       ├── main.rs           # 入口：加载配置、启动子系统、SIGTERM
-│   │       ├── manager.rs        # ChannelManager：增删/重启/热重载
-│   │       ├── control.rs        # UDS 控制接口服务端
-│   │       └── channel/
-│   │           ├── mod.rs        # ChannelHandle：标准/直通模式任务编排
-│   │           ├── mirror_pool.rs# MirrorPool：镜像健康度+指数退避
-│   │           ├── cache.rs      # SegmentCache：内存分片缓存+广播
-│   │           ├── downloader.rs # Downloader：RoundRobin+Race 下载策略
-│   │           ├── poller.rs     # Poller：media playlist 轮询+去重
-│   │           ├── m3u8.rs       # 极简 m3u8 解析器
-│   │           ├── http_server.rs# InternalHttpServer：HLS+TS字节流
-│   │           ├── ffmpeg_supervisor.rs # ffmpeg 监控/重启
-│   │           └── iface.rs      # 接口名→IP 解析（ubus/ip/直接IP）
-│   │
-│   └── m3u8mcctl/                # CLI 控制工具
-│       └── src/main.rs           # status/reload/channel start|stop|restart
-│
-├── openwrt-package/              # OpenWrt 打包骨架
-│   ├── Makefile                  # ipk 打包规则（预编译二进制安装模式）
-│   ├── files/
-│   │   ├── m3u8mc.init           # procd init 脚本
-│   │   ├── m3u8mc.config         # UCI 默认配置（含注释示例）
-│   │   └── network-isolation.sh  # VLAN+防火墙隔离脚本
-│   └── luci/
-│       ├── controller/m3u8mc.lua # 菜单路由 + Ajax API
-│       ├── model/cbi/m3u8mc/
-│       │   ├── channels.lua      # 频道管理 CBI 表单
-│       │   └── isolation.lua     # 网络隔离 CBI 表单
-│       ├── view/m3u8mc/
-│       │   ├── status.htm        # 运行状态页模板
-│       │   └── ffmpeg.htm        # FFmpeg 管理页模板（下载/检测/恢复默认）
-│       └── htdocs/
-│           └── m3u8mc-status.js  # 状态页前端（纯 ES5，无依赖）
-│
-└── smoketest/                    # 本机冒烟测试辅助文件
-```
 
-## 快速开始（本机验证）
+2. 快速开始
 
-```bash
-# 1. 编译
-cargo build -p m3u8mcd -p m3u8mcctl
+2.1 准备配置文件
 
-# 2. 起一个模拟 m3u8 源（任意目录下有 playlist.m3u8 + seg*.ts）
-cd smoketest/fixtures && python3 -m http.server 19999 &
+在宿主机创建配置目录和配置文件：
 
-# 3. 启动 daemon
-./target/debug/m3u8mcd --config smoketest/m3u8mc.conf &
-
-# 4. 查看状态
-./target/debug/m3u8mcctl --socket smoketest/m3u8mcd.sock status
-
-# 5. 热重载（修改 smoketest/m3u8mc.conf 后）
-./target/debug/m3u8mcctl --socket smoketest/m3u8mcd.sock reload
-```
-
-## 交叉编译（上路由器）
-
-```bash
-cargo install cargo-zigbuild
-pip install ziglang
-
-# AArch64（IPQ807x 等）
-./build.sh aarch64-unknown-linux-musl
-
-# MIPSEL
-./build.sh mipsel-unknown-linux-musl
-```
-
-产物在 `bin/<target-triple>/`，静态链接 musl libc，无运行时依赖。
-
-## OpenWrt 打包
-
-```bash
-# 在 OpenWrt SDK 的 package/ 下：
-RUST_TARGET_TRIPLE=aarch64-unknown-linux-musl \
-  make package/m3u8mc/compile V=s
-```
-
-## UCI 配置快速参考
-
-```uci
+bashmkdir -p /etc/m3u8mc
+cat > /etc/m3u8mc/m3u8mc << 'EOF'
 config global
-    option enabled      '1'
-    option log_level    'warning'
+    option enabled        1
+    option log_level      info
+    option http_port_base 18080
+
+config channel 'cctv1'
+    option enabled  1
+    option name     'CCTV-1'
+    list   url      'http://your-source.example.com/cctv1/playlist.m3u8'
+    option addr     '239.1.1.1'
+    option port     5000
+    option iface    'eth0'
+EOF
+
+2.2 启动容器
+
+bashdocker run -d \
+  --name m3u8mc \
+  --restart unless-stopped \
+  --network host \
+  -v /etc/m3u8mc:/etc/config \
+  ghcr.io/mylucien/m3u8mc:latest \
+  --config /etc/config/m3u8mc
+
+
+注意：--network host 是必须的，组播/UDP 发包需要直接访问宿主机网络接口，bridge 网络无法正确绑定组播地址。
+
+
+
+2.3 验证运行状态
+
+bash# 查看日志
+docker logs -f m3u8mc
+
+# 查看频道状态
+docker exec m3u8mc m3u8mcctl status
+
+
+3. 配置文件详解
+
+配置文件采用 OpenWrt UCI 格式，分为 global 和 channel 两类 section。
+
+3.1 global 配置
+
+参数默认值说明enabled1全局开关，0 时 daemon 启动但不拉起任何频道log_levelwarning日志级别：error / warning / info / debug / tracecontrol_socket/var/run/m3u8mcd.sockUnix Domain Socket 路径，m3u8mcctl 通过此路径与 daemon 通信http_port_base18080内置 HTTP 服务端口起始值，各频道依次递增自动分配ffmpeg_bin（从 PATH 查找）指定 ffmpeg 可执行文件的完整路径，留空则使用系统 PATH 中的 ffmpeg
+
+3.2 channel 配置
+
+必填参数
+
+参数默认值说明url（list）—HLS 源地址，可配置多个（仅 use_downloader=1 时允许多源）addr—组播目标 IP 地址，如 239.1.1.1port—组播目标端口，如 5000
+
+网络参数
+
+参数默认值说明ifacelan发送组播包的网络接口名，容器中通常为 eth0ttl4组播 TTL 值pkt_size1316UDP 包大小（字节）protocolrtp输出协议：rtp 或 udp
+
+缓存与性能参数
+
+参数默认值说明cache_window3缓存时间窗口（以 target_duration 为单位）max_segments5内存中最多保留的 TS 分片数量hls_segments3内置 HTTP playlist 中包含的分片数量buffer_size1048576下载缓冲区大小（字节，默认 1MB）threads4下载并发线程数
+
+内置 HTTP 服务参数
+
+参数默认值说明use_downloader11=标准模式（缓存+HTTP服务），0=直通模式（直接透传给 ffmpeg）http_port自动分配内置 HTTP 服务端口，不填则从 http_port_base 自动递增分配http_path/liveHTTP 路径前缀，播放地址为 http://host:port/live/playlist.m3u8
+
+赛马模式（race_mode）
+
+赛马模式适用于源站有多个 IP 但共用一个域名的场景，对所有 IP 同时发起请求，取最快响应的数据。
+
+参数默认值说明race_mode0启用赛马模式race_ip（list）—候选 IP，格式为 1.2.3.4 或 1.2.3.4@host.example.comrace_host（自动推断）全局默认赛马 Host，优先级低于 race_ip 中的 @host
+
+代理与 HTTP 头参数
+
+参数默认值说明list_proxy（空）拉取 m3u8 列表时使用的代理，格式 http://host:portdownload_proxy（空）下载 TS 分片时使用的代理http_header（list）—通用 HTTP 请求头，格式：Key: Valuepoller_http_header（list）—仅用于拉列表的 HTTP 头，未配置时继承 http_headerdownloader_http_header（list）—仅用于拉分片的 HTTP 头，未配置时继承 http_headerlist_url（list）—独立的列表拉取地址，未配置时使用 urllist_poll_interval0列表刷新间隔（秒），0 表示跟随 m3u8 中的 target_duration
+
+ffmpeg 参数透传
+
+参数默认值说明ffmpeg_input_arg（list）—追加到 ffmpeg -i 之前的输入参数ffmpeg_output_arg（list）—追加到 ffmpeg 输出部分的参数
+
+
+4. 完整配置示例
+
+4.1 标准模式（多频道）
+
+config global
+    option enabled        1
+    option log_level      info
+    option http_port_base 18080
+
+config channel 'cctv1'
+    option enabled        1
+    option name           'CCTV-1'
+    list   url            'http://source1.example.com/cctv1/playlist.m3u8'
+    list   url            'http://source2.example.com/cctv1/playlist.m3u8'
+    option addr           '239.1.1.1'
+    option port           5000
+    option iface          'eth0'
+    option cache_window   3
+    option max_segments   5
 
 config channel 'cctv5'
-    option enabled      '1'
-    option name         'CCTV-5 体育'
-    list   url          'http://mirror1.example.com/cctv5/playlist.m3u8'
-    list   url          'http://mirror2.example.com/cctv5/playlist.m3u8'
-    option protocol     'udp'
-    option addr         '239.1.1.1'
-    option port         '5001'
-    option iface        'lan'
-    option use_downloader '1'
-    option race_mode    '0'
-```
+    option enabled        1
+    option name           'CCTV-5'
+    list   url            'http://source1.example.com/cctv5/playlist.m3u8'
+    option addr           '239.1.1.2'
+    option port           5000
+    option iface          'eth0'
+    list   http_header    'User-Agent: Mozilla/5.0'
+    list   http_header    'Referer: http://example.com'
 
-## FFmpeg 管理（LuCI）
+4.2 赛马模式
 
-OpenWrt 官方 ffmpeg 包通常编译精简（可能缺 h264 比特流过滤器、部分 muxer），
-「服务 → m3u8mc 转播 → FFmpeg 管理」页面提供：
+config channel 'iptv_race'
+    option enabled    1
+    option name       '赛马频道'
+    list   url        'http://cdn.example.com/live/playlist.m3u8'
+    option addr       '239.1.1.10'
+    option port       5000
+    option iface      'eth0'
+    option race_mode  1
+    list   race_ip    '1.2.3.4'
+    list   race_ip    '5.6.7.8@mirror2.cdn.com'
+    option race_host  'cdn.example.com'
 
-- **能力检测**：当前 ffmpeg 路径/版本/关键能力（mpegts muxer / rtp muxer /
-  h264_mp4toannexb bsf / hls demuxer）一目了然
-- **一键下载**：按 CPU 架构自动填入推荐的静态编译版本下载地址（x86_64/aarch64/armv7/i686
-  来自 johnvansickle.com 的长期维护构建；MIPS 系架构暂无公开静态源，需手动填写）
-- **自定义地址**：支持任意 URL，兼容 tar.xz/tar.gz/tar.bz2 压缩包或裸二进制直链
-- **后台异步执行**：下载解压走后台进程+进度文件轮询，不阻塞 LuCI 请求，避免路由器慢速网络下超时
-- **自动生效**：安装成功后自动写入 `m3u8mc.global.ffmpeg_bin` 并热重载，无需手动重启
-- **一键恢复**：随时可清空自定义路径，回退到系统 PATH 中的 ffmpeg
+4.3 直通模式（passthrough）
 
-对应后端脚本：`openwrt-package/files/ffmpeg-install.sh`（check / download / set-uci / reset-uci 四个子命令）。
+config channel 'direct'
+    option enabled        1
+    option name           '直通频道'
+    option use_downloader 0
+    list   url            'http://source.example.com/live/playlist.m3u8'
+    option addr           '239.1.1.20'
+    option port           5000
+    option iface          'eth0'
+    list   ffmpeg_input_arg  '-timeout'
+    list   ffmpeg_input_arg  '5000000'
 
-## 已知限制 / 后续可做
 
-- 网络隔离脚本目前只做单 VLAN，未覆盖多频道各自独立 VLAN 的场景
-- MIPS 架构没有默认下载源，需用户自行编译并提供直链
+5. m3u8mcctl 控制命令
+
+查看状态
+
+bash# 人类可读格式
+docker exec m3u8mc m3u8mcctl status
+
+# JSON 格式（适合脚本解析）
+docker exec m3u8mc m3u8mcctl status --json
+
+状态字段说明：
+
+字段说明CHANNEL频道 ID（section 名称）ENABLED配置中是否启用RUNNING当前是否正在运行MODEstandard（标准）或 passthrough（直通）CACHE当前内存中缓存的 TS 分片数量RESTARTSffmpeg 进程累计重启次数OVERLOAD是否处于过载状态（下载速度跟不上播放速度）PLAY_URL内置 HTTP 服务的 HLS 播放地址
+
+热重载配置
+
+bash# 修改宿主机配置文件后，无需重启容器
+docker exec m3u8mc m3u8mcctl reload
+
+
+reload 只对有变更的频道做增量处理，未变更的频道不受影响，播放不中断。
+
+
+
+频道操作
+
+bash# 启动指定频道
+docker exec m3u8mc m3u8mcctl channel start --name cctv1
+
+# 停止指定频道
+docker exec m3u8mc m3u8mcctl channel stop --name cctv1
+
+# 重启指定频道
+docker exec m3u8mc m3u8mcctl channel restart --name cctv1
+
+# 停止所有频道（daemon 进程保持存活）
+docker exec m3u8mc m3u8mcctl stop-all
+
+
+6. 内置 HTTP 服务（HLS 回放）
+
+每个 use_downloader=1 的频道都会启动一个独立的 HTTP 服务，提供以下接口：
+
+接口路径说明HLS 播放列表GET /live/playlist.m3u8包含最近 hls_segments 个分片TS 分片GET /live/seg/:seq按序号获取单个 TS 分片连续字节流GET /live/stream.ts持续推送 TS 字节流，适合 VLC 等播放器直接拉流
+
+播放示例（假设 http_port_base=18080，第一个频道自动分配 18080 端口）：
+
+bash# HLS 播放（VLC / ffplay / mpv）
+ffplay http://宿主机IP:18080/live/playlist.m3u8
+
+# TS 字节流
+ffplay http://宿主机IP:18080/live/stream.ts
+
+# 第二个频道端口自动为 18081
+ffplay http://宿主机IP:18081/live/playlist.m3u8
+
+
+7. docker-compose 部署
+
+yamlservices:
+  m3u8mc:
+    image: ghcr.io/mylucien/m3u8mc:latest
+    container_name: m3u8mc
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /etc/m3u8mc:/etc/config
+    command: ["--config", "/etc/config/m3u8mc"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+8. 常见问题
+
+组播包发出去了但收不到
+
+
+确认使用了 --network host，bridge 模式无法正确处理组播
+确认 iface 配置的网卡名与宿主机实际网卡名一致（容器内是 eth0，宿主机可能是 ens3 等）
+确认路由器/交换机开启了 IGMP Snooping
+
+
+m3u8mcctl: daemon not running
+
+
+control_socket 默认为 /var/run/m3u8mcd.sock，确认容器内外路径一致
+确认 daemon 进程正在运行：docker exec m3u8mc ps aux | grep m3u8mcd
+
+
+频道 RUNNING=false，RESTARTS 不断增加
+
+
+查看日志：docker logs m3u8mc，找 ffmpeg 报错信息
+确认源地址可访问：docker exec m3u8mc wget -q -O- 'http://your-source/playlist.m3u8' | head
+如需代理，配置 list_proxy 和 download_proxy
+
+
+日志输出太多
+
+
+将 log_level 改为 warning 或 error
+配置 docker logging driver 限制日志文件大小（见 docker-compose 示例）
