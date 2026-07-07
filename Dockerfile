@@ -21,8 +21,10 @@ RUN set -eu; \
             cp /tmp/ffmpeg-bundle/bin/ffmpeg  /usr/local/bin/ffmpeg; \
             cp /tmp/ffmpeg-bundle/bin/ffprobe /usr/local/bin/ffprobe; \
             chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe; \
-            find /tmp/ffmpeg-bundle/lib -name '*.so*' ! -name 'ld-musl-*' \
-                -exec cp {} /usr/local/lib/ \;; \
+            for so in /tmp/ffmpeg-bundle/lib/*.so*; do \
+                case "$so" in *ld-musl-*) continue ;; esac; \
+                cp "$so" /usr/local/lib/; \
+            done; \
             ldconfig /usr/local/lib 2>/dev/null || true; \
             ;; \
         *) \
