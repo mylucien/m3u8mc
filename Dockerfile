@@ -3,7 +3,7 @@
 # 这里只是按 buildx 传入的 TARGETPLATFORM 挑对应架构的产物塞进 alpine 镜像，
 # 不在容器里现场编译。
 
-FROM alpine:3.20
+FROM alpine:3.22
 
 ARG TARGETPLATFORM
 
