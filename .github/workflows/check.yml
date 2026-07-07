@@ -1,10 +1,13 @@
 # 检验插件：验证 m3u8mc Makefile 和 Rust 源码
 #
-# 每次 push / PR 自动运行（immortalwrt SDK 编译验证）：
-#   1. 检查 Makefile 格式（无注释在 define 块内等）
-#   2. 检查必要文件齐全
-#   3. 运行 Rust 单元测试
-#   4. 验证预编译二进制存在且是合法 ELF
+# 触发：每次 push / PR 自动运行
+#
+# Job 结构：
+#   rust-tests          → Rust 单元测试
+#   validate-makefile   → Makefile 格式 + 必要文件检查
+#   openwrt-build       → 从最新 Release 下载预编译二进制
+#                         → ImmortalWrt SDK 编译打包 ipk
+#                         → 将 ipk 发布到同一个 Release
 
 name: check
 
@@ -21,6 +24,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Rust 单元测试 ──────────────────────────────────────────
   rust-tests:
     name: Rust unit tests
     runs-on: ubuntu-22.04
@@ -37,6 +41,7 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --verbose
 
+  # ── Makefile 格式 + 文件结构检查 ──────────────────────────
   validate-makefile:
     name: Validate Makefiles & package structure
     runs-on: ubuntu-22.04
@@ -52,23 +57,18 @@ jobs:
             in_block=""
             while IFS= read -r line; do
               if echo "$line" | grep -q "^define "; then
-                in_block="yes"
-                continue
+                in_block="yes"; continue
               fi
               if echo "$line" | grep -q "^endef"; then
-                in_block=""
-                continue
+                in_block=""; continue
               fi
               if [ -n "$in_block" ] && echo "$line" | grep -qE "^\s+#"; then
-                echo "::error file=$mf::Comment found inside define block: $line"
+                echo "::error file=$mf::Comment inside define block: $line"
                 errors=$((errors + 1))
               fi
             done < "$mf"
           done
-          if [ "$errors" -gt 0 ]; then
-            echo "Found $errors comment(s) inside define blocks"
-            exit 1
-          fi
+          [ "$errors" -gt 0 ] && { echo "$errors comment(s) inside define blocks"; exit 1; }
           echo "No comments inside define blocks"
 
       - name: Verify required fields in Makefiles
@@ -83,7 +83,6 @@ jobs:
                 exit 1
               fi
             done
-            # DEPENDS is optional for luci packages (but should exist)
             if grep -q "^\s*DEPENDS:=" "$mf"; then
               deps=$(grep "^\s*DEPENDS:=" "$mf" | sed 's/.*DEPENDS:=//')
               if echo "$deps" | grep -q "libxz"; then
@@ -92,84 +91,115 @@ jobs:
               fi
               echo "  DEPENDS=$deps OK"
             fi
-            if grep -q "^\s*SUBMENU:=" "$mf"; then
-              echo "  SUBMENU set"
-            else
-              echo "  SUBMENU missing (warning)"
-            fi
           done
 
       - name: Verify required files exist
         run: |
           missing=0
-          required_m3u8mc=(
-            "m3u8mc/files/m3u8mc.init"
-            "m3u8mc/files/m3u8mc.config"
-            "m3u8mc/files/ffmpeg-install.sh"
-          )
-          for f in "${required_m3u8mc[@]}"; do
-            if [ -f "$f" ]; then echo "$f"; else echo "::error file=$f::missing"; missing=$((missing+1)); fi
+          for f in \
+            "m3u8mc/files/m3u8mc.init" \
+            "m3u8mc/files/m3u8mc.config" \
+            "m3u8mc/files/ffmpeg-install.sh" \
+            "luci-app-m3u8mc/luci/controller/m3u8mc.lua" \
+            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channels.lua" \
+            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channel_edit.lua" \
+            "luci-app-m3u8mc/luci/view/m3u8mc/status.htm" \
+            "luci-app-m3u8mc/luci/view/m3u8mc/log.htm"; do
+            if [ -f "$f" ]; then echo "  OK $f"
+            else echo "::error file=$f::missing"; missing=$((missing+1)); fi
           done
-          required_luci=(
-            "luci-app-m3u8mc/luci/controller/m3u8mc.lua"
-            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channels.lua"
-            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channel_edit.lua"
-            "luci-app-m3u8mc/luci/view/m3u8mc/status.htm"
-            "luci-app-m3u8mc/luci/view/m3u8mc/log.htm"
-          )
-          for f in "${required_luci[@]}"; do
-            if [ -f "$f" ]; then echo "$f"; else echo "::error file=$f::missing"; missing=$((missing+1)); fi
-          done
-          if [ "$missing" -gt 0 ]; then echo "$missing file(s) missing"; exit 1; fi
+          [ "$missing" -gt 0 ] && { echo "$missing file(s) missing"; exit 1; }
           echo "All required files present"
 
-  validate-binaries:
-    name: Check prebuilt binaries
+  # ── 从 Release 取二进制 → 编译 ipk → 发布到 Release ──────
+  openwrt-build:
+    name: ImmortalWrt compile & publish ipk
     runs-on: ubuntu-22.04
-    defaults:
-      run:
-        working-directory: m3u8mc
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify prebuilt binaries are valid ELF files
+      # ── 找到最新 Release 并下载所有架构的 tar.gz ────────────
+      - name: Get latest release info
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_json=$(gh api repos/${{ github.repository }}/releases/latest)
+          tag=$(echo "$release_json" | jq -r '.tag_name')
+          upload_url=$(echo "$release_json" | jq -r '.upload_url' | sed 's/{.*//')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upload_url=$upload_url" >> "$GITHUB_OUTPUT"
+          echo "Latest release: $tag"
+
+      - name: Download prebuilt binaries from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.release.outputs.tag }}"
+          mkdir -p bin
+
+          # 下载所有架构的 tarball
+          gh release download "$tag" \
+            --repo "${{ github.repository }}" \
+            --pattern "m3u8mc-*.tar.gz" \
+            --dir /tmp/release-assets
+
+          # 解压并强制整理到 bin/<triple>/ 目录
+          for tarball in /tmp/release-assets/m3u8mc-*.tar.gz; do
+            fname=$(basename "$tarball" .tar.gz)
+            triple="${fname#m3u8mc-}"
+
+            # 1. 创建目标架构目录
+            target_dir="bin/${triple}"
+            mkdir -p "$target_dir"
+
+            # 2. 先解压到临时目录，避免 strip-components 误判
+            tmp_extract="/tmp/extract_${triple}"
+            mkdir -p "$tmp_extract"
+            tar xzf "$tarball" -C "$tmp_extract"
+
+            # 3. 在临时目录中查找二进制文件并移动到目标目录
+            #    无论 tar 包内是否有顶层文件夹都能正确归位
+            find "$tmp_extract" -type f \( -name "m3u8mcd" -o -name "m3u8mcctl" \) \
+              -exec cp {} "$target_dir/" \;
+
+            # 4. 清理临时目录
+            rm -rf "$tmp_extract"
+
+            echo "✅ Extracted to $target_dir:"
+            ls -lh "$target_dir/"
+          done
+
+      - name: Verify extracted binaries are valid ELF
         run: |
           failures=0
           for triple_dir in bin/*/; do
             triple=$(basename "$triple_dir")
-            for bin in m3u8mcd m3u8mcctl; do
-              path="${triple_dir}${bin}"
+            for bin_name in m3u8mcd m3u8mcctl; do
+              path="${triple_dir}${bin_name}"
               if [ ! -f "$path" ]; then
-                echo "::warning::Missing $bin for $triple"
+                echo "::warning::Missing $bin_name for $triple"
                 continue
               fi
               size=$(stat -c%s "$path")
               if ! file "$path" | grep -q "ELF"; then
-                echo "::error file=$path::$bin for $triple is not a valid ELF binary"
+                echo "::error file=$path::Not a valid ELF binary"
                 failures=$((failures + 1))
               elif [ "$size" -lt 100000 ]; then
-                echo "::warning file=$path::$bin for $triple is suspiciously small (${size} bytes)"
+                echo "::warning file=$path::Suspiciously small (${size} bytes)"
               else
-                echo "✅ $triple/$bin: ELF verified, ${size} bytes"
+                echo "✅ $triple/$bin_name: ELF OK, ${size} bytes"
               fi
             done
           done
-          if [ "$failures" -gt 0 ]; then
-            echo "❌ $failures binary verification(s) failed"
-            exit 1
-          fi
-          echo "✅ All prebuilt binaries are valid"
+          [ "$failures" -gt 0 ] && { echo "❌ $failures binary verification(s) failed"; exit 1; }
+          echo "✅ All prebuilt binaries verified"
 
-  openwrt-build:
-    name: ImmortalWrt compile (x86_64)
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout (m3u8mc)
-        uses: actions/checkout@v4
-        with:
-          path: m3u8mc
-
+      # ── ImmortalWrt SDK 编译 ──────────────────────────────
       - name: Restore ImmortalWrt SDK from cache
         id: cache-sdk
         uses: actions/cache@v4
@@ -181,56 +211,59 @@ jobs:
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           SDK_URL="https://downloads.immortalwrt.org/releases/23.05.4/targets/x86/64/immortalwrt-sdk-23.05.4-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          echo "Downloading SDK (370MB, first time only, may take a few minutes)..."
-          curl -fsSL --connect-timeout 60 --max-time 600 \
-            -o /tmp/sdk.tar.xz "$SDK_URL"
-          echo "Extracting..."
+          echo "Downloading SDK..."
+          curl -fsSL --connect-timeout 60 --max-time 600 -o /tmp/sdk.tar.xz "$SDK_URL"
           tar -xJf /tmp/sdk.tar.xz -C /tmp
           mv /tmp/immortalwrt-sdk-* /tmp/immortalwrt-sdk
-          echo "SDK ready at /tmp/immortalwrt-sdk"
 
-      - name: Link packages and compile
+      - name: Compile ipk packages
         run: |
           SDK_DIR=/tmp/immortalwrt-sdk
           export TERM=linux
-          # 分别 link 两个独立包（先清理缓存中可能的旧目录/链接）
+
+          # 把下载好的二进制放到 m3u8mc/bin/ 供 Makefile PREBUILT 使用
+          cp -r bin m3u8mc/bin
+
+          # 链接包目录
           rm -rf "$SDK_DIR/package/m3u8mc" "$SDK_DIR/package/luci-app-m3u8mc"
-          ln -s "${{ github.workspace }}/m3u8mc/m3u8mc" \
-            "$SDK_DIR/package/m3u8mc"
-          ln -s "${{ github.workspace }}/m3u8mc/luci-app-m3u8mc" \
-            "$SDK_DIR/package/luci-app-m3u8mc"
-          ls -la "$SDK_DIR/package/m3u8mc/Makefile"
-          ls -la "$SDK_DIR/package/luci-app-m3u8mc/Makefile"
+          ln -s "${{ github.workspace }}/m3u8mc"          "$SDK_DIR/package/m3u8mc"
+          ln -s "${{ github.workspace }}/luci-app-m3u8mc" "$SDK_DIR/package/luci-app-m3u8mc"
 
           cd "$SDK_DIR"
-          export TERM=linux
           make defconfig 2>&1
-          echo "Config ready"
 
-          # 编译 m3u8mc
           RUST_TARGET_TRIPLE=x86_64-unknown-linux-musl \
-            make package/m3u8mc/compile V=s 2>&1 || {
-            echo "m3u8mc compilation failed"
-            exit 1
-          }
-          echo "m3u8mc compiled"
+            make package/m3u8mc/compile V=s 2>&1 || { echo "m3u8mc compile failed"; exit 1; }
 
-          # 编译 luci-app-m3u8mc（纯文件复制，秒级）
-          make package/luci-app-m3u8mc/compile V=s 2>&1 || {
-            echo "luci-app-m3u8mc compilation failed"
-            exit 1
-          }
-          echo "luci-app-m3u8mc compiled"
-          IPK_LIST=$(find "$SDK_DIR/bin" -name "*m3u8mc*.ipk" 2>/dev/null)
-          echo "$IPK_LIST"
-          for ipk in $IPK_LIST; do
-            cp "$ipk" "${{ github.workspace }}/"
-            echo "✅ $(basename $ipk)"
-          done
+          make package/luci-app-m3u8mc/compile V=s 2>&1 || { echo "luci-app-m3u8mc compile failed"; exit 1; }
 
-      - name: Upload ipk as artifact
+          # 收集 ipk
+          mkdir -p "${{ github.workspace }}/ipk"
+          find "$SDK_DIR/bin" -name "*m3u8mc*.ipk" -exec cp {} "${{ github.workspace }}/ipk/" \;
+          echo "=== Built ipk files ==="
+          ls -lh "${{ github.workspace }}/ipk/"
+
+      - name: Upload ipk as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: m3u8mc-ipk-x86_64
-          path: "*.ipk"
-          if-no-files-found: ignore
+          path: ipk/*.ipk
+          if-no-files-found: warn
+
+      # ── 将 ipk 追加发布到同一个 Release ─────────────────────
+      - name: Publish ipk to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.release.outputs.tag }}"
+          for ipk in ipk/*.ipk; do
+            [ -f "$ipk" ] || continue
+            fname=$(basename "$ipk")
+            echo "Uploading $fname to release $tag..."
+            # 如果同名文件已存在先删除（re-run 场景）
+            gh release delete-asset "$tag" "$fname" \
+              --repo "${{ github.repository }}" --yes 2>/dev/null || true
+            gh release upload "$tag" "$ipk" \
+              --repo "${{ github.repository }}" --clobber
+            echo "✅ $fname uploaded"
+          done
