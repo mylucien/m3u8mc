@@ -278,8 +278,12 @@ impl Downloader {
                     client.get(&url).header(reqwest::header::RANGE, range).send(),
                 )
                 .await??;
-                if !resp.status().is_success() {
-                    anyhow::bail!("range request failed: {}", resp.status());
+                if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    // Range 请求必须严格要求 206。用 is_success() 会把某些服务器
+                    // 不支持/忽略 Range 头、直接回退整体内容(200 OK)的情况也当成"这一块
+                    // 下载成功"，导致每个并发分块请求实际都拿到了完整文件，拼接后产生
+                    // threads 倍大小的损坏分片（而不是报错走整体下载兜底）。
+                    anyhow::bail!("range request did not return 206 Partial Content: {}", resp.status());
                 }
                 let bytes = resp.bytes().await?;
                 Ok::<(u64, Bytes), anyhow::Error>((start, bytes))
