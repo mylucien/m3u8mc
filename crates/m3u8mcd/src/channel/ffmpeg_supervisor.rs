@@ -26,6 +26,26 @@ const FATAL_LOG_KEYWORDS: &[&str] = &[
     "End of file",
     "I/O error",
     "Conversion failed",
+    // 以下几个是之前遗漏、但确实应该触发主动重启的连接类致命错误
+    // （对齐 Python 版本 _FATAL_PATTERNS，之前只能靠 30s 静默超时兜底，响应滞后）
+    "Error opening input",
+    "Connection timed out",
+    "Network unreachable",
+    "moov atom not found",
+    "No route to host",
+    "broken pipe",
+];
+
+/// 良性/预期内的日志片段：命中这些就直接跳过 fatal 判断，不做其他处理。
+/// 对齐 Python 版本的 _IGNORE_PATTERNS。目的有两个：
+/// 1) 避免把 ffmpeg 正常重连/追赶时间线过程中的噪声（DTS 抖动、重复行折叠提示等）
+///    误判为异常并触发不必要的重启；
+/// 2) 防止未来给 FATAL_LOG_KEYWORDS 加词时，恰好和这些良性噪声行产生子串碰撞。
+const IGNORE_LOG_PATTERNS: &[&str] = &[
+    "Last message repeated",
+    "non monotonous",
+    "DTS out of order",
+    "max_analyze_duration",
 ];
 
 #[derive(Default)]
@@ -133,7 +153,11 @@ impl FfmpegSupervisor {
         cmd.arg(self.output_url(local_ip));
 
         cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
+        // stdout 从不被读取（只有 supervise_child 读 stderr）。之前用 Stdio::piped() 会创建
+        // 一个从未被消费的管道：一旦 ffmpeg 在某些边界情况下往 stdout 写入超过管道缓冲区
+        // （Linux 默认 64KB）的内容，写入方会永久阻塞，进而挂起整个 ffmpeg 进程。既然
+        // 代码设计上就没打算使用 stdout，直接丢弃更安全。
+        cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
         cmd
@@ -226,7 +250,9 @@ impl FfmpegSupervisor {
                     Ok(Some(line)) => {
                         let _ = activity_tx.send(());
                         tracing::debug!(channel = %self.channel_id(), "ffmpeg: {line}");
-                        if FATAL_LOG_KEYWORDS.iter().any(|kw| line.contains(kw)) {
+                        if IGNORE_LOG_PATTERNS.iter().any(|kw| line.contains(kw)) {
+                            // 良性噪声（DTS 抖动、重复行折叠提示等），跳过 fatal 判断
+                        } else if FATAL_LOG_KEYWORDS.iter().any(|kw| line.contains(kw)) {
                             tracing::warn!(channel = %self.channel_id(), "ffmpeg fatal keyword matched: {line}");
                             let _ = fatal_tx.send(true);
                             // 不 break：让 log_task 继续读到 EOF，避免与 fatal_rx.changed()
