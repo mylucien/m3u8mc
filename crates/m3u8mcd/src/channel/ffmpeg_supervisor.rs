@@ -15,7 +15,7 @@ use tokio::sync::watch;
 
 const LOG_SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTART_DELAY: Duration = Duration::from_secs(2);
-const WARMUP_POLL_TIMEOUT: Duration = Duration::from_secs(20);
+const WARMUP_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const WARMUP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 const FATAL_LOG_KEYWORDS: &[&str] = &[
