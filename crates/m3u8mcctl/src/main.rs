@@ -6,8 +6,19 @@ use m3u8mc_common::protocol::{Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+/// 编译期由 build.rs 注入，跟 m3u8mcd 保持同一套版本信息格式，方便确认
+/// ctl 和 daemon 是不是配套的同一次构建。
+const VERSION_INFO: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (commit ",
+    env!("M3U8MC_GIT_SHA"),
+    ", built ",
+    env!("M3U8MC_BUILD_TIME"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
-#[command(name = "m3u8mcctl")]
+#[command(name = "m3u8mcctl", version = VERSION_INFO)]
 struct Args {
     #[arg(long, default_value = "/var/run/m3u8mcd.sock")]
     socket: String,
