@@ -8,8 +8,20 @@ use manager::ChannelManager;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
+/// 编译期由 build.rs 注入（见 build.rs 顶部说明）。拼成完整版本串，
+/// `m3u8mcd --version` 直接就能看到是哪个 commit、什么时候编译的，
+/// 避免部署后没法确认跑的是不是预期的那次修复。
+const VERSION_INFO: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (commit ",
+    env!("M3U8MC_GIT_SHA"),
+    ", built ",
+    env!("M3U8MC_BUILD_TIME"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
-#[command(name = "m3u8mcd", about = "m3u8 转组播 OpenWrt 插件 daemon")]
+#[command(name = "m3u8mcd", about = "m3u8 转组播 OpenWrt 插件 daemon", version = VERSION_INFO)]
 struct Args {
     /// UCI 配置文件路径，对应 /etc/config/m3u8mc
     #[arg(long, default_value = "/etc/config/m3u8mc")]
@@ -32,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("global.enabled=0, daemon will idle without starting any channel");
     }
 
-    tracing::info!(channels = parsed.channels.len(), "loaded configuration");
+    tracing::info!(version = VERSION_INFO, channels = parsed.channels.len(), "loaded configuration");
 
     let manager = ChannelManager::new(args.config.to_string_lossy().to_string());
     // 无论 global.enabled 是否为 true，都要把解析好的配置写入 current_config，
