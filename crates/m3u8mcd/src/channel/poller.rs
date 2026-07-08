@@ -5,6 +5,7 @@
 //! - 检测 sequence 异常回退（上游重启）并重置追踪基线；
 //! - media url 连续失败达到阈值后判定 token 失效，触发重新解析 master playlist。
 
+use super::cache::SegmentCache;
 use super::downloader::{apply_proxy, parse_headers, Downloader, SegmentTask};
 use super::m3u8::{self, ParsedPlaylist};
 use super::mirror_pool::MirrorPool;
@@ -23,6 +24,12 @@ pub struct Poller {
     client: reqwest::Client,
     mirror_pool: Arc<MirrorPool>,
     downloader: Arc<Downloader>,
+    /// 用于在拿到上游真实 target_duration 后动态刷新缓存淘汰窗口（见
+    /// `SegmentCache::set_window` 的说明），避免频道启动时基于固定 6s/分片估计出的
+    /// 窗口跟真实分片时长偏差过大，导致分片还没被 ffmpeg 取走就被提前淘汰。
+    cache: Arc<SegmentCache>,
+    /// = 配置里的 cache_window，即窗口时长相对分片时长的倍数
+    cache_window_multiplier: f32,
     /// 配置里的原始镜像 url 列表（master/media playlist 地址，每个镜像一条）
     origin_urls: Vec<String>,
     /// 解析出的各镜像 media playlist 完整地址，按 origin_urls 顺序对应
@@ -36,9 +43,12 @@ pub struct Poller {
 }
 
 impl Poller {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mirror_pool: Arc<MirrorPool>,
         downloader: Arc<Downloader>,
+        cache: Arc<SegmentCache>,
+        cache_window_multiplier: f32,
         origin_urls: Vec<String>,
         http_headers: &[String],
         poll_interval_secs: f32,
@@ -58,6 +68,8 @@ impl Poller {
             client: builder.build().expect("failed to build reqwest client"),
             mirror_pool,
             downloader,
+            cache,
+            cache_window_multiplier,
             origin_urls,
             media_urls: Mutex::new(Vec::new()),
             last_target_duration: Mutex::new(6.0),
@@ -168,7 +180,20 @@ impl Poller {
             match self.fetch_media_playlist().await {
                 Ok(playlist) => {
                     consecutive_failures = 0;
-                    *self.last_target_duration.lock().unwrap() = playlist.target_duration;
+                    let target_duration = playlist.target_duration;
+                    let changed = {
+                        let mut last = self.last_target_duration.lock().unwrap();
+                        let changed = (*last - target_duration).abs() > 0.01;
+                        *last = target_duration;
+                        changed
+                    };
+                    if changed && target_duration > 0.0 {
+                        // 用上游真实 target_duration 重新计算淘汰窗口，避免频道启动时
+                        // 6s/分片的保守估计跟真实分片时长偏差过大（见 SegmentCache::set_window）。
+                        let window = Duration::from_secs_f32(target_duration * self.cache_window_multiplier);
+                        self.cache.set_window(window);
+                        tracing::info!(target_duration, window_secs = window.as_secs_f32(), "refreshed cache eviction window from real target_duration");
+                    }
                     self.process_playlist(playlist);
                 }
                 Err(e) => {
