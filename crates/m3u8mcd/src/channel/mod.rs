@@ -74,6 +74,8 @@ impl ChannelHandle {
         let poller = Poller::new(
             Arc::clone(&mirror_pool),
             Arc::clone(&downloader),
+            Arc::clone(&cache),
+            config.cache_window as f32,
             config.effective_list_urls().to_vec(),
             config.effective_poller_headers(),
             config.list_poll_interval_secs,
