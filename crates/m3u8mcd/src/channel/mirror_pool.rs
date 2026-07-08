@@ -105,8 +105,16 @@ impl MirrorPool {
     pub fn report_success(&self, server: &str) {
         if let Some(mut st) = self.state.get_mut(server) {
             st.consecutive_failures = 0;
-            st.paused_until = None;
             st.backoff_idx = 0;
+            // 注意：不清 paused_until。是否解除暂停只由 is_available() 里的时间比较
+            // （Instant::now() >= until）自然决定，对齐 Python 版本的设计——
+            // report_success 里从不触碰 available 状态，只有 report_task_failed 里
+            // 起的 _recover 定时器睡够退避时长后才会真正解除暂停。
+            //
+            // 之前这里会直接把 paused_until 置 None：因为 available_servers() 在
+            // "全部服务器都在退避中"时会兜底返回全量列表（包含仍在退避期内的服务器），
+            // 这些服务器完全可能被选中重试；一旦某次重试凑巧成功，退避状态就被立刻
+            // 清空，一台本应还在惩罚期的不稳定服务器瞬间"满血复活"，退避保护形同虚设。
         }
     }
 
