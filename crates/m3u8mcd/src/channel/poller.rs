@@ -253,7 +253,14 @@ impl Poller {
             self.downloader.submit(new_tasks);
         }
 
-        self.last_max_global_seq.store(current_max, Ordering::Relaxed);
+        // 关键修复：last_max_global_seq 语义上是"迄今为止见过的最大 seq"，必须单调不减。
+        // 之前这里是无条件 store：一旦某次上游播放列表的 base_seq+len(segments) 比历史值小
+        // （多镜像/多 CDN 节点数据不完全同步导致的窗口抖动很容易触发），游标会被直接拽回去，
+        // 造成已下载过的分片被重新判定为"新分片"再次提交下载，还会污染下面轮的
+        // SEQUENCE_ROLLBACK_THRESHOLD 硬重置判断基准。改用 fetch_max 保证只增不减，
+        // 与旧版 Python 实现里 `if new_segs: self._seen_seq = new_segs[-1]["seq"]`
+        // （只在真正推进时更新，且取当轮最大值）的语义保持一致。
+        self.last_max_global_seq.fetch_max(current_max, Ordering::Relaxed);
         self.has_baseline.store(true, Ordering::Relaxed);
     }
 }
