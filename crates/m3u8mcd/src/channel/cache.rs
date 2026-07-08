@@ -21,8 +21,10 @@ pub struct CachedSegment {
 pub struct SegmentCache {
     segments: DashMap<u64, CachedSegment>,
     max_segments: usize,
-    /// 时间窗口淘汰时长 = 分片时长 × cache_window（见设计文档 2.2 关键参数取值依据）
-    window: Duration,
+    /// 时间窗口淘汰时长 = 分片时长 × cache_window（见设计文档 2.2 关键参数取值依据）。
+    /// 用纳秒存成 AtomicU64，允许 Poller 在拿到上游真实 target_duration 后动态刷新，
+    /// 而不是永远锁死在频道启动时的保守估计值上（见 `set_window` 的说明）。
+    window_nanos: AtomicU64,
     next_seq: AtomicU64,
     /// 广播新分片 seq，供 InternalHttpServer 的 TS 连续流模式订阅
     notify: broadcast::Sender<u64>,
@@ -34,10 +36,26 @@ impl SegmentCache {
         Arc::new(SegmentCache {
             segments: DashMap::new(),
             max_segments,
-            window,
+            window_nanos: AtomicU64::new(window.as_nanos().min(u64::MAX as u128) as u64),
             next_seq: AtomicU64::new(0),
             notify: tx,
         })
+    }
+
+    fn window(&self) -> Duration {
+        Duration::from_nanos(self.window_nanos.load(Ordering::Relaxed))
+    }
+
+    /// 用上游真实 target_duration 刷新淘汰窗口。频道启动时 window 只是按 6s/分片的
+    /// 保守估计算出来的（见 mod.rs），如果实际分片时长跟这个估计偏差较大（比如
+    /// 上游是 2s 或 10s 一片），或者下游 ffmpeg 因为限速参数（如 -readrate）暂时落后
+    /// 于实时进度，固定不变的窗口要么淘汰得太快（分片还没被 ffmpeg 取走就被清掉，
+    /// 表现为 ffmpeg 日志里的 "skipping N segments ahead, expired from playlists" /
+    /// 时间戳跳变），要么白白占用内存。这里允许 Poller 每次拿到最新 target_duration
+    /// 时调用本方法刷新窗口，让淘汰策略贴近真实分片节奏。
+    pub fn set_window(&self, window: Duration) {
+        self.window_nanos
+            .store(window.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
     }
 
     /// 分配下一个内部 seq 号（与上游原始分片序号无关，由 daemon 自行编号）。
@@ -62,8 +80,9 @@ impl SegmentCache {
     fn evict(&self) {
         let now = Instant::now();
         // 时间窗口淘汰
+        let window = self.window();
         self.segments
-            .retain(|_, seg| now.duration_since(seg.inserted_at) <= self.window);
+            .retain(|_, seg| now.duration_since(seg.inserted_at) <= window);
         // 数量上限淘汰：超出部分淘汰最旧的 seq
         if self.segments.len() > self.max_segments {
             let mut seqs: Vec<u64> = self.segments.iter().map(|e| *e.key()).collect();
