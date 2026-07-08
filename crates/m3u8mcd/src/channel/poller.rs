@@ -18,7 +18,6 @@ use url::Url;
 const MEDIA_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_INVALID_THRESHOLD: u32 = 5;
 /// sequence 回退超过该幅度才判定为"上游服务器重启"，而非普通抖动
-const SEQUENCE_ROLLBACK_THRESHOLD: u64 = 50;
 
 pub struct Poller {
     client: reqwest::Client,
@@ -244,15 +243,31 @@ impl Poller {
 
     fn process_playlist(&self, playlist: m3u8::MediaPlaylist) {
         let base_seq = playlist.media_sequence;
-        let current_max = base_seq + playlist.segments.len() as u64;
+        let seg_count = playlist.segments.len() as u64;
+        let current_max = base_seq + seg_count;
 
         let has_baseline = self.has_baseline.load(Ordering::Relaxed);
         let last_max = self.last_max_global_seq.load(Ordering::Relaxed);
 
-        if has_baseline && base_seq + SEQUENCE_ROLLBACK_THRESHOLD < last_max {
+        // 重置阈值改为动态 2×playlist_len（对齐旧版 Python 的
+        // `last_seq_in_playlist < seen_seq - len(segments)*2`），而不是固定的 50。
+        // 直播 playlist 通常只有 3~5 个分片，固定阈值 50 意味着"真实的上游重启/切源"
+        // （比如序号只回退了 10~20）根本触发不了硬重置：baseline 不会被清零，
+        // start_from 仍然停留在重启前的旧序号上，之后每一轮新 playlist 里的 global_seq
+        // 全都小于 start_from，被当成"已处理过的旧分片"过滤掉——相当于这个频道从此
+        // 再也没有新分片被提交下载，表现为频道卡死不动但没有任何报错。
+        let last_seq_in_playlist = base_seq + seg_count.saturating_sub(1);
+        let rollback_reset_threshold = seg_count.saturating_mul(2);
+
+        if has_baseline
+            && seg_count > 0
+            && last_seq_in_playlist < last_max.saturating_sub(rollback_reset_threshold)
+        {
             tracing::warn!(
                 old_max = last_max,
                 new_base = base_seq,
+                playlist_len = seg_count,
+                reset_threshold = rollback_reset_threshold,
                 "media sequence rolled back sharply, assuming upstream server restarted; resetting baseline"
             );
             self.has_baseline.store(false, Ordering::Relaxed);
