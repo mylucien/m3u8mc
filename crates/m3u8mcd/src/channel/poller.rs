@@ -201,15 +201,22 @@ impl Poller {
                     tracing::warn!(error = %e, consecutive_failures, "media playlist fetch failed");
                     if consecutive_failures >= TOKEN_INVALID_THRESHOLD {
                         tracing::warn!("media url repeatedly failing, treating as token expiry, re-resolving master playlist");
+                        // 无论这次重新解析 master 成功与否都重置计数：
+                        // 之前只在 Ok 分支重置，失败时 consecutive_failures 会一直停留在
+                        // >= TOKEN_INVALID_THRESHOLD 的状态，导致下一轮只要 media 拉取
+                        // 再失败一次（大概率会失败，因为 media_urls 还是旧值），就会立刻
+                        // 再次触发重新解析 master——原本"攒够 N 次失败再重试"的退避意图
+                        // 被破坏，变成对 master playlist 的密集轮询。这里对齐旧版 Python
+                        // 实现（`self._fail_count = 0` 无条件执行）的行为。
                         match self.resolve_master().await {
                             Ok(bases) => {
                                 self.reinit_mirror_pool(bases);
-                                consecutive_failures = 0;
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "re-resolving master playlist also failed");
                             }
                         }
+                        consecutive_failures = 0;
                     }
                 }
             }
