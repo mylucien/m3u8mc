@@ -159,9 +159,10 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
     let mut next_auto_port = global.http_port_base;
     let mut used_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
 
-    // 先收集已手动指定的端口，避免自动分配时冲突
+    // 先收集已手动指定的端口，避免自动分配时冲突。
+    // 与第二遍的 filter(|s| !s.is_empty()) 保持一致，跳过空字符串。
     for sec in uci.sections_of("channel") {
-        if let Some(p) = sec.get("http_port") {
+        if let Some(p) = sec.get("http_port").filter(|s| !s.is_empty()) {
             if let Ok(p) = p.parse::<u16>() {
                 used_ports.insert(p);
             }
