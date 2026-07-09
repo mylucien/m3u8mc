@@ -1,6 +1,6 @@
 # 检验插件：验证 m3u8mc Makefile 和 Rust 源码
 #
-# 触发：每次 push / PR 自动运行/
+# 触发触发：每次 push / PR 自动运行/
 #
 # Job 结构：
 #   rust-tests          → Rust 单元测试
