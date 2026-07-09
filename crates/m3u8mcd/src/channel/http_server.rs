@@ -21,6 +21,8 @@ use std::time::Duration;
 struct ServerState {
     cache: Arc<SegmentCache>,
     hls_segments: usize,
+    /// 归一化后的 http_path（如 "/live"），用于生成 m3u8 里的绝对分片路径
+    http_path: String,
 }
 
 pub async fn serve(
@@ -37,9 +39,13 @@ pub async fn serve(
     let state = ServerState {
         cache,
         hls_segments,
+        http_path: path.clone(),
     };
 
     let playlist_route = format!("{path}/playlist.m3u8");
+    // 路由用子目录格式（axum 只支持 /:param，不支持前缀拼接如 seg_:seq）。
+    // playlist 里写绝对路径，兼容 ffmpeg / VLC / 浏览器等各类客户端，
+    // 避免相对路径被部分播放器丢失 http_path 前缀而 404。
     let segment_route = format!("{path}/seg/:seq");
     let stream_route = format!("{path}/stream.ts");
 
@@ -85,7 +91,7 @@ async fn playlist_handler(State(state): State<ServerState>) -> Response {
     for seq in recent {
         if let Some(seg) = state.cache.get(*seq) {
             body.push_str(&format!("#EXTINF:{:.3},\n", seg.duration_secs));
-            body.push_str(&format!("seg/{}.ts\n", seg.seq));
+            body.push_str(&format!("{}/seg/{}.ts\n", state.http_path, seg.seq));
         }
     }
 
