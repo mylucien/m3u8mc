@@ -147,7 +147,7 @@ impl Downloader {
             let this = Arc::clone(self);
             let seq = this.cache.alloc_seq();
             tokio::spawn(async move {
-                let _permit = this.semaphore.acquire().await;
+                let _permit = this.semaphore.acquire().await.unwrap();
                 let result = match this.strategy {
                     DownloadStrategy::RoundRobin => this.download_round_robin(&task).await,
                     DownloadStrategy::Race => this.download_race(&task).await,
@@ -278,14 +278,13 @@ impl Downloader {
                     client.get(&url).header(reqwest::header::RANGE, range).send(),
                 )
                 .await??;
+                // Range 请求成功必须是 206 Partial Content；
+                // 若服务器返回 200 说明不支持 Range，数据是完整内容而非分块，
+                // 此时继续拼接会产生 n_threads 倍的重复数据，应当报错回退整体下载。
                 if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-                    // Range 请求必须严格要求 206。用 is_success() 会把某些服务器
-                    // 不支持/忽略 Range 头、直接回退整体内容(200 OK)的情况也当成"这一块
-                    // 下载成功"，导致每个并发分块请求实际都拿到了完整文件，拼接后产生
-                    // threads 倍大小的损坏分片（而不是报错走整体下载兜底）。
-                    anyhow::bail!("range request did not return 206 Partial Content: {}", resp.status());
+                    anyhow::bail!("range request returned {} (expected 206)", resp.status());
                 }
-                let bytes = resp.bytes().await?;
+                let bytes = tokio::time::timeout(WHOLE_DOWNLOAD_TIMEOUT, resp.bytes()).await??;
                 Ok::<(u64, Bytes), anyhow::Error>((start, bytes))
             });
         }
@@ -365,11 +364,12 @@ impl Downloader {
                     req = req.header(reqwest::header::HOST, h.clone());
                 }
                 let result = async {
-                    let resp = req.send().await?;
+                    let resp = tokio::time::timeout(READ_STALL_TIMEOUT, req.send()).await??;
                     if !resp.status().is_success() {
                         anyhow::bail!("status {}", resp.status());
                     }
-                    let bytes = resp.bytes().await?;
+                    // 对响应体读取单独设超时，防止服务器慢速响应导致 race 整体卡死
+                    let bytes = tokio::time::timeout(WHOLE_DOWNLOAD_TIMEOUT, resp.bytes()).await??;
                     Ok::<Bytes, anyhow::Error>(bytes)
                 }
                 .await;
@@ -377,21 +377,36 @@ impl Downloader {
             });
         }
 
-        let mut last_err: Option<anyhow::Error> = None;
-        while let Some((server, result)) = futs.next().await {
-            match result {
-                Ok(data) => {
-                    self.mirror_pool.report_success(&server);
-                    // 其余仍在进行的请求随 futs 被 drop 时自然 abort（FuturesUnordered 析构会取消未完成 future）
-                    return Ok(data);
-                }
-                Err(e) => {
-                    self.mirror_pool.report_task_failed(&server);
-                    last_err = Some(e);
+        // 兜底超时：所有候选的内部 timeout 均已覆盖，此处作为最后防线，
+        // 与 Python 版 winner_event.wait(timeout=self.timeout + 5) 对齐。
+        let race_timeout = READ_STALL_TIMEOUT + WHOLE_DOWNLOAD_TIMEOUT + Duration::from_secs(5);
+        let race_result = tokio::time::timeout(race_timeout, async {
+            let mut last_err: Option<anyhow::Error> = None;
+            while let Some((server, result)) = futs.next().await {
+                match result {
+                    Ok(data) => {
+                        self.mirror_pool.report_success(&server);
+                        // 其余仍在进行的请求随 futs 被 drop 时自然 abort（FuturesUnordered 析构会取消未完成 future）
+                        return Ok(data);
+                    }
+                    Err(e) => {
+                        self.mirror_pool.report_task_failed(&server);
+                        last_err = Some(e);
+                    }
                 }
             }
+            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all race candidates failed")))
+        })
+        .await;
+
+        match race_result {
+            Ok(inner) => inner,
+            Err(_) => anyhow::bail!(
+                "race mode timed out after {:.0}s for {}",
+                race_timeout.as_secs_f32(),
+                task.rel_path
+            ),
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all race candidates failed")))
     }
 }
 
@@ -434,8 +449,19 @@ fn parse_race_ip_entry(entry: &str) -> (String, Option<String>) {
 
 /// 把 UCI list http_header 的字符串列表解析为 reqwest HeaderMap。
 /// 每条格式为 "Header-Name: value"，解析失败的条目记录 warn 后跳过。
+///
+/// 默认注入 `User-Agent: Mozilla/5.0`，与 Python 版本行为一致。
+/// 用户配置的同名 header 会覆盖该默认值（insert 语义：后写覆盖先写）。
 pub fn parse_headers(raw: &[String]) -> HeaderMap {
     let mut map = HeaderMap::new();
+    // 先插入默认 UA，用户配置的同名 header 会在后续循环中覆盖它。
+    // Python 版本在 Poller session 和 Downloader._headers_for 里都硬编码了
+    // "User-Agent: Mozilla/5.0"；不设置时 reqwest 默认发送 "reqwest/x.x.x"，
+    // 许多 CDN 会直接以 403 拒绝非浏览器 UA。
+    map.insert(
+        reqwest::header::USER_AGENT,
+        HeaderValue::from_static("Mozilla/5.0 (Linux; Android 9; ATV1200 Build/PPR1.180610.011; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/91.0.4472.114 Safari/537.36"),
+    );
     for entry in raw {
         match entry.splitn(2, ':').collect::<Vec<_>>().as_slice() {
             [name, value] => {
