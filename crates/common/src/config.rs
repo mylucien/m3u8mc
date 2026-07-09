@@ -229,7 +229,7 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
             max_segments: sec.get_parsed("max_segments", 5usize),
             hls_segments: sec.get_parsed("hls_segments", 3usize),
             http_port,
-            http_path: sec.get_or("http_path", "/live"),
+            http_path: sec.get("http_path").filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| "/live".to_string()),
             use_downloader,
             race_mode: sec.get_bool("race_mode", false),
             race_ips: sec.list("race_ip").iter().filter(|s| !s.is_empty()).cloned().collect(),
