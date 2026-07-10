@@ -35,9 +35,13 @@ local name = s:option(Value, "name", translate("频道名称"))
 name.rmempty = false
 name.placeholder = "如：澳视体育"
 
--- 镜像源地址（list url，多行动态列表）
+-- 镜像源地址（分片下载 base，多行动态列表）
 local url = s:option(DynamicList, "url", translate("镜像源地址"),
-    translate("内容相同的多个镜像 URL，逐行填写；直通模式下只允许一条"))
+    translate("分片下载所用的 base 地址，内容相同的多个镜像逐行填写，标准模式下轮询/故障切换，赛马模式下作为默认竞速候选。\n" ..
+              "未单独配置「列表专用地址」时，本项同时兼作拉取列表的地址。\n" ..
+              "若上游 m3u8 里的分片是绝对 URL（自带完整 https://... 地址），本项会覆盖其域名/协议/端口（路径/查询参数保留分片原有的部分）；\n" ..
+              "此时本项只能填 域名[:端口] 或 协议://域名[:端口]，不能带路径，否则该条会被跳过（分片相对路径场景不受此限制，可以带路径）。\n" ..
+              "直通模式下只允许一条。"))
 url.placeholder = "http://..."
 url.rmempty = false
 
@@ -81,19 +85,24 @@ race.default = "0"
 race:depends("use_downloader", "1")
 
 local race_ips = s:option(DynamicList, "race_ip", translate("赛马节点 IP"),
-    translate("支持两种格式：\n" ..
-              "  纯 IP：1.2.3.4（Host 使用全局 race_host 或自动推断）\n" ..
-              "  IP@域名：5.6.7.8@mirror2.cdn.com（为该节点单独指定 Host）\n" ..
-              "不同格式可在同一频道混用"))
+    translate("支持两种格式（每行一条，可混用）：\n" ..
+              "  纯 IP/域名：1.2.3.4 或 cdn.example.com（不带协议默认用 http，可显式写 https://1.2.3.4:8443）\n" ..
+              "  地址@Host：5.6.7.8@mirror2.cdn.com（为该节点单独指定 HTTP Host 请求头）\n" ..
+              "@ 后面的 Host 不允许带协议（只能是 域名[:端口]）。\n" ..
+              "某节点若未用 @Host 指定专属 Host，则使用下方「赛马全局 Host」；两者都未配置时，\n" ..
+              "该节点按纯 IP/域名请求发出，不附带任何 Host 覆盖。\n" ..
+              "只要配置了本项（任意一条），赛马竞速就只使用这里的节点，上方「镜像源地址」不再参与竞速。"))
 race_ips.placeholder = "1.2.3.4 或 5.6.7.8@mirror2.cdn.com"
 race_ips:depends("race_mode", "1")
 
--- 全局赛马 Host（可选，不填则自动推断自第一个镜像域名）
+-- 全局赛马 Host（可选）：
+-- 配置了 race_ip 时，作为没有 @Host 的节点的 Host 请求头兜底；
+-- 未配置 race_ip 时，作为镜像源地址（url）参与竞速时的域名覆盖。
 local race_host = s:option(Value, "race_host", translate("赛马全局 Host"),
-    translate("所有未用 IP@域名 格式指定专属 Host 的赛马节点，统一使用此域名作为 HTTP Host 头。\n" ..
-              "留空则自动推断自第一个镜像 URL 的域名（原有行为）。\n" ..
-              "配置了此项后可避免多节点共用同一域名时的推断歧义。"))
-race_host.placeholder = "cdn.example.com"
+    translate("未用 地址@Host 格式指定专属 Host 的赛马节点，统一使用此值作为 HTTP Host 请求头（只能是 域名[:端口]，不允许带协议）。\n" ..
+              "若未配置「赛马节点 IP」，则本项会替换掉「镜像源地址」参与竞速时使用的域名（协议、端口仍取自镜像源地址，除非这里填了端口）。\n" ..
+              "留空则不做任何 Host/域名覆盖：有赛马节点时该节点按纯 IP/域名请求；无赛马节点时按镜像源地址本身请求。"))
+race_host.placeholder = "cdn.example.com 或 cdn.example.com:8443"
 race_host.rmempty = true
 race_host:depends("race_mode", "1")
 
@@ -107,8 +116,11 @@ threads:depends("use_downloader", "1")
 -- ── 高级选项：独立列表拉取配置 ────────────────────────────────
 local list_url = s:option(DynamicList, "list_url", translate("列表专用地址（可选）"),
     translate("仅当'获取 m3u8 列表'与'下载 ts 分片'需要走不同源时才配置。\n" ..
-              "留空则用上方镜像源地址来拉取列表（原有行为）。\n" ..
-              "填写后，列表拉取走这里配置的地址，分片下载走上方镜像源地址。"))
+              "留空则用上方镜像源地址来拉取列表。\n" ..
+              "填写后，列表拉取只走这里配置的地址，不再参与分片下载；分片下载完全由上方镜像源地址决定。\n" ..
+              "注意：若上游分片是相对路径（非绝对 URL），必须同时配置「镜像源地址」，\n" ..
+              "否则分片下载会因为没有 base 地址而报错（只填本项、分片又是相对路径时不再回退用本项当下载 base）。\n" ..
+              "若上游分片本身就是绝对 URL，则可以只填本项，不填「镜像源地址」。"))
 list_url.placeholder = "http://list.origin.com/index.m3u8"
 list_url.rmempty = true
 list_url:depends("use_downloader", "1")
