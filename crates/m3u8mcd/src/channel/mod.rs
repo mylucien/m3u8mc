@@ -48,7 +48,14 @@ impl ChannelHandle {
     fn spawn_standard(config: ChannelConfig, ffmpeg_bin: String) -> Self {
         let (stop_tx, stop_rx) = watch::channel(false);
 
-        let mirror_pool = MirrorPool::new(Vec::new());
+        // 问题2 修复：mirror_pool（下载 base 池）直接、且唯一地来自 config.urls，
+        // 不再由 Poller 解析 media playlist 目录后动态派生/替换。
+        // list_url 与 url 职责彻底分离：list_url 只喂给 Poller 拉列表，
+        // url（=mirror_pool 的初始内容）才是分片下载真正使用的 base。
+        // 只填 list_url、不填 url 时，这里就是空列表——相对路径分片会在
+        // Downloader::download_round_robin 里报错（无下载 base），绝对路径分片
+        // 则会直接使用分片自带的绝对地址下载，不需要 base。
+        let mirror_pool = MirrorPool::new(config.urls.clone());
         // 初始窗口用 target_duration 的保守估计（6s）× cache_window，
         // Poller 拿到真实 target_duration 后该估计可能略有偏差，但足以满足设计文档
         // 2.2 节 "cache_window 决定的时间窗口应大于等于 hls_segments 覆盖时长" 的约束。
@@ -72,7 +79,6 @@ impl ChannelHandle {
         );
 
         let poller = Poller::new(
-            Arc::clone(&mirror_pool),
             Arc::clone(&downloader),
             Arc::clone(&cache),
             config.cache_window as f32,
