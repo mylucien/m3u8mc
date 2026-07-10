@@ -86,7 +86,13 @@ pub struct ChannelConfig {
 
 impl ChannelConfig {
     /// 实际用于拉取列表（Poller）的源地址：
-    /// 优先使用独立配置的 list_urls，未配置时回退到 urls（向后兼容旧配置）。
+    /// 优先使用独立配置的 list_urls，未配置时回退到 urls（向后兼容旧配置，
+    /// 即"只填 url 无 list_url"时 url 同时承担列表源的职责）。
+    ///
+    /// 注意：这个方法只服务于"拉列表"这一件事。下载 base 完全由 `urls` 字段
+    /// 独立决定（见 MirrorPool 的初始化，直接使用 `self.urls`），不再由这里
+    /// 派生，也不再随 Poller 解析出的 media playlist 目录变化——
+    /// list_url 与 url 各司其职：list_url 只管拉列表，url 只管下载分片。
     pub fn effective_list_urls(&self) -> &[String] {
         if self.list_urls.is_empty() {
             &self.urls
