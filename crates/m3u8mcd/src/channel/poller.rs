@@ -8,7 +8,6 @@
 use super::cache::SegmentCache;
 use super::downloader::{apply_proxy, parse_headers, Downloader, SegmentTask};
 use super::m3u8::{self, ParsedPlaylist};
-use super::mirror_pool::MirrorPool;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,7 +20,6 @@ const TOKEN_INVALID_THRESHOLD: u32 = 5;
 
 pub struct Poller {
     client: reqwest::Client,
-    mirror_pool: Arc<MirrorPool>,
     downloader: Arc<Downloader>,
     /// 用于在拿到上游真实 target_duration 后动态刷新缓存淘汰窗口（见
     /// `SegmentCache::set_window` 的说明），避免频道启动时基于固定 6s/分片估计出的
@@ -30,6 +28,8 @@ pub struct Poller {
     /// = 配置里的 cache_window，即窗口时长相对分片时长的倍数
     cache_window_multiplier: f32,
     /// 配置里的原始镜像 url 列表（master/media playlist 地址，每个镜像一条）
+    /// 注意：这里只用于拉取列表本身，不再作为下载 base 的来源
+    /// （下载 base 完全由 ChannelConfig.urls 独立决定，见 mod.rs 里 MirrorPool 的初始化）。
     origin_urls: Vec<String>,
     /// 解析出的各镜像 media playlist 完整地址，按 origin_urls 顺序对应
     media_urls: Mutex<Vec<String>>,
@@ -44,7 +44,6 @@ pub struct Poller {
 impl Poller {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mirror_pool: Arc<MirrorPool>,
         downloader: Arc<Downloader>,
         cache: Arc<SegmentCache>,
         cache_window_multiplier: f32,
@@ -65,7 +64,6 @@ impl Poller {
         };
         Arc::new(Poller {
             client: builder.build().expect("failed to build reqwest client"),
-            mirror_pool,
             downloader,
             cache,
             cache_window_multiplier,
@@ -86,14 +84,20 @@ impl Poller {
         Ok(resp.text().await?)
     }
 
-    /// 二级播放列表解析：返回每个镜像 media playlist 所在目录的 base url
-    /// （MirrorPool 的 server 标识，与 Downloader::build_url 拼接逻辑对应），
-    /// 同时把各镜像的 media playlist 完整地址记入 self.media_urls。
-    async fn resolve_master(&self) -> anyhow::Result<Vec<String>> {
+    /// 二级播放列表解析：只负责解析出每个镜像 media playlist 的完整地址并记入
+    /// self.media_urls，供后续轮询 fetch_media_playlist 使用。
+    ///
+    /// 问题2 修复：不再计算/返回下载 base（原来的 "media playlist 所在目录"），
+    /// 也不再据此驱动 MirrorPool（下载 base 完全由 ChannelConfig.urls 独立提供，
+    /// 一次性在 channel 启动时传给 MirrorPool，不随这里的解析结果变化）。
+    /// 同理，也不再自动把 race_host 推断为 media playlist 所在域名——
+    /// 赛马模式下的 Host 覆盖现在完全由用户显式配置的 race_host / race_ip@host 决定，
+    /// 不做任何隐式推断（详见 Downloader::effective_race_host）。
+    async fn resolve_master(&self) -> anyhow::Result<()> {
         let first_url = self
             .origin_urls
             .first()
-            .ok_or_else(|| anyhow::anyhow!("channel has no configured urls"))?;
+            .ok_or_else(|| anyhow::anyhow!("channel has no configured list url"))?;
 
         let text = self.fetch_text(first_url).await?;
         let parsed = m3u8::parse(&text);
@@ -108,7 +112,6 @@ impl Poller {
         };
 
         let mut media_urls = Vec::with_capacity(self.origin_urls.len());
-        let mut bases = Vec::with_capacity(self.origin_urls.len());
         for origin in &self.origin_urls {
             let media_url = match &variant_path {
                 Some(path) => {
@@ -117,24 +120,11 @@ impl Poller {
                 }
                 None => origin.clone(),
             };
-            let dir = media_url
-                .rsplit_once('/')
-                .map(|(d, _)| d.to_string())
-                .unwrap_or_else(|| media_url.clone());
-            bases.push(dir);
             media_urls.push(media_url);
         }
 
-        // 更新 race_host 为 media playlist 所在域名（修复跨域名场景下 race_host 推导错误）
-        // 必须在 master 解析完成后才能确定，不能在 Downloader 初始化时静态推导。
-        let media_host = media_urls
-            .first()
-            .and_then(|u| url::Url::parse(u).ok())
-            .and_then(|u| u.host_str().map(|s| s.to_string()));
-        self.downloader.set_race_host(media_host);
-
         *self.media_urls.lock().unwrap() = media_urls;
-        Ok(bases)
+        Ok(())
     }
 
     /// 拉取一次 media playlist：依次尝试已记录的各镜像 media url，任一成功即返回。
@@ -160,10 +150,7 @@ impl Poller {
         // 初始解析，失败则退避重试，不让整个频道任务直接退出
         loop {
             match self.resolve_master().await {
-                Ok(bases) => {
-                    self.reinit_mirror_pool(bases);
-                    break;
-                }
+                Ok(()) => break,
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to resolve master playlist, retrying in 5s");
                     if wait_or_stop(&mut stop_rx, Duration::from_secs(5)).await {
@@ -208,9 +195,7 @@ impl Poller {
                         // 被破坏，变成对 master playlist 的密集轮询。这里对齐旧版 Python
                         // 实现（`self._fail_count = 0` 无条件执行）的行为。
                         match self.resolve_master().await {
-                            Ok(bases) => {
-                                self.reinit_mirror_pool(bases);
-                            }
+                            Ok(()) => {}
                             Err(e) => {
                                 tracing::warn!(error = %e, "re-resolving master playlist also failed");
                             }
@@ -231,14 +216,6 @@ impl Poller {
                 return;
             }
         }
-    }
-
-    /// MirrorPool 的 server 列表在 master 重新解析后可能变化（极少见，host 不会变但保留扩展性），
-    /// 当前实现里 MirrorPool 在 channel 启动时一次性创建，这里仅做日志提示；
-    /// 如需热替换 server 列表，可在 MirrorPool 上扩展 `replace_servers` 方法。
-    fn reinit_mirror_pool(&self, bases: Vec<String>) {
-        tracing::info!(?bases, "resolved media playlist bases");
-        self.mirror_pool.replace_servers(bases);
     }
 
     fn process_playlist(&self, playlist: m3u8::MediaPlaylist) {
