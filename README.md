@@ -310,26 +310,138 @@ services:
 
 ---
 
-## 8. 常见问题
+# `list_url` / `url` / 赛马模式配置指南
 
-### 组播包发出去了但收不到
+本文档说明频道配置里 `list_url`、`url`、`race_mode`、`race_ip`、`race_host` 这几个参数的职责与组合行为，适用于标准模式（`use_downloader=1`）下的频道配置。
 
-- 确认使用了 `--network host`，bridge 模式无法正确处理组播
-- 确认 `iface` 配置的网卡名与宿主机实际网卡名一致（容器内是 `eth0`，宿主机可能是 `ens3` 等）
-- 确认路由器/交换机开启了 IGMP Snooping
+## 一、基本概念
 
-### m3u8mcctl: daemon not running
+| 参数 | 职责 |
+|---|---|
+| `list_url` | 只负责拉取播放列表（master/media playlist），周期性轮询获取分片列表。**不参与分片下载**。 |
+| `url` | 分片下载的 base 地址来源。标准模式下用于拼接/覆盖分片下载地址；赛马模式下用于在没有配置 `race_ip` 时提供默认竞速候选。 |
+| `race_mode` | 是否开启赛马模式：`0` 为标准轮询模式，`1` 为赛马模式（多候选并发请求，取最快返回）。 |
+| `race_ip` | 赛马模式下的候选连接目标，可配置多条，格式为 `地址` 或 `地址@host`。 |
+| `race_host` | 赛马模式下全局默认的 HTTP `Host` 请求头覆盖值。 |
 
-- `control_socket` 默认为 `/var/run/m3u8mcd.sock`，确认容器内外路径一致
-- 确认 daemon 进程正在运行：`docker exec m3u8mc ps aux | grep m3u8mcd`
+`list_url` 与 `url` 都可以配置多条（多镜像/多备份源）。
 
-### 频道 RUNNING=false，RESTARTS 不断增加
+## 二、`list_url` 与 `url` 的组合规则
 
-- 查看日志：`docker logs m3u8mc`，找 ffmpeg 报错信息
-- 确认源地址可访问：`docker exec m3u8mc wget -q -O- 'http://your-source/playlist.m3u8' | head`
-- 如需代理，配置 `list_proxy` 和 `download_proxy`
+- **只配 `list_url`，不配 `url`**：`list_url` 承担"拉列表"的职责。是否需要额外配置 `url` 取决于分片地址形式：
+  - 播放列表里的分片是**绝对地址**（如 `https://cdn6.cc.cd/api/amty/2283368`）：不需要配 `url`，直接使用分片自带的完整地址下载。
+  - 播放列表里的分片是**相对路径**（如 `seg100.ts`）：**必须**配置 `url` 提供下载 base，否则下载会报错（无法拼出完整下载地址）。
+- **只配 `url`，不配 `list_url`**：`url` 同时承担"拉列表"和"下载 base"两个职责，等价于把同一个地址填两遍。
+- **`list_url` 与 `url` 都配置**：`list_url` 专职拉列表，`url` 专职作下载 base。此时无论分片是相对路径还是绝对地址都能正常下载：
+  - 相对路径：`url` 作为 join 的 base，分片路径拼接在其后。
+  - 绝对地址：`url` 的域名/协议/端口会**覆盖**分片自带的地址（分片的 path/query 保留不变）。
 
-### 日志输出太多
+### 组合速查表（标准模式）
 
-- 将 `log_level` 改为 `warning` 或 `error`
-- 配置 docker logging driver 限制日志文件大小（见 docker-compose 示例）
+| 配置 | 分片相对路径 | 分片绝对地址 |
+|---|---|---|
+| 只有 `list_url` | ❌ 报错（无下载 base） | ✅ 直接用分片自带地址下载 |
+| 只有 `url` | ✅（`url` 同时充当列表源和下载 base） | ✅（同上，url 覆盖生效） |
+| `list_url` + `url` | ✅ 用 `url` 拼接 | ✅ `url` 覆盖分片自带地址 |
+
+> 注意：`url` 若配置为覆盖绝对地址分片，只能是 `scheme://host[:port]` 或 `host[:port]` 形式（不能带路径）。如果 `url` 里带了路径（比如 `https://cdn.com/live`），这条 `url` 只能用于相对路径场景的 join，用来覆盖绝对地址分片时会被跳过并记录警告日志，请为绝对地址场景单独配置不带路径的 `url`。
+
+## 三、赛马模式（`race_mode=1`）
+
+赛马模式下，同一个分片会**同时向多个候选发起请求，取最快返回的结果**，用于绕开 DNS/CDN 调度、强制连接到指定地址。候选来源和优先级如下：
+
+### 3.1 候选来源优先级：`race_ip` 优先于 `url`
+
+- **配置了 `race_ip`（一条或多条）**：只用 `race_ip` 候选竞速，`url` 完全不参与（即使配置了 `list_url`+`url`，`url` 也会被忽略）。
+- **没有配置 `race_ip`**：退化为用 `url`（即 `list_url`+`url` 组合里的 `url`，或只配了 `url` 时的那个值）作为候选竞速，此时行为接近标准模式的多镜像轮询，只是改为并发请求。
+- **`race_ip` 和 `url` 都没配置**（只有 `list_url`）：赛马模式没有任何候选可用，下载会报错。
+
+### 3.2 `race_ip` 的写法
+
+```
+race_ip = 地址
+race_ip = 地址@host
+```
+
+- **地址**部分（`@` 前面，或整条无 `@`）：赛马候选的实际连接目标，支持：
+  - 纯 IP：`1.2.3.4`、`1.2.3.4:8443`
+  - 域名：`cdn.example.com`、`cdn.example.com:522`
+  - 带协议前缀：`https://1.2.3.4:8443`、`https://cdn.example.com:522`
+  - 不带协议前缀时，默认使用 `http`。
+- **`@host` 部分**（可选）：这条候选专属的 HTTP `Host` 请求头覆盖值，**不允许带协议**（只能是 `host[:port]`，带了协议会被忽略并记录警告日志）。
+
+可以配置多条 `race_ip`，每条都会作为独立候选参与竞速。
+
+### 3.3 Host 请求头的确定规则
+
+赛马模式下，每个 `race_ip` 候选实际发送请求时使用的 `Host` 请求头，按以下优先级确定：
+
+1. 该候选自带的 `@host`（最高优先级）；
+2. 全局配置的 `race_host`（`@host` 未指定时使用）；
+3. 都没有配置：**不发送 Host 覆盖**，即视为纯 IP/域名直连请求。
+
+`race_host` 同样**不允许带协议**，只能是 `host[:port]` 形式，带协议的配置会被忽略并记录警告日志。
+
+### 3.4 没有配置 `race_ip`、只有 `url` 时，`race_host` 的作用
+
+这种情况下，`race_host` 会**替换掉 `url` 候选的域名**（协议和端口沿用 `url` 自身，除非 `race_host` 自带端口）：
+
+- `race_host` 不带端口：只换域名，端口沿用 `url` 原有端口（或该协议的默认端口）；
+- `race_host` 带端口（如 `mirror2.cdn.com:9999`）：域名和端口一起替换。
+
+### 3.5 组合速查表（赛马模式）
+
+| `race_ip` | `race_host` | 相对路径分片 | 绝对路径分片 |
+|---|---|---|---|
+| 未配置 | 未配置 | 用 `url` 候选，Host 头不设 | 用 `url` 候选覆盖分片地址，Host 头不设 |
+| 未配置 | 已配置 | 用 `url` 候选，但域名被 `race_host` 替换 | 同左 |
+| 已配置 | 未配置 | 只用 race_ip 候选，Host 头不设（除非 `@host` 指定） | 同左 |
+| 已配置 | 已配置 | 只用 race_ip 候选，Host 头取 `@host`（无则取 `race_host`） | 同左 |
+| 未配置 | 未配置，且 `url` 也未配置 | ❌ 报错（无候选） | ❌ 报错（无候选） |
+
+## 四、常见配置示例
+
+### 示例 1：CDN 分片给的是绝对地址，用赛马模式直连指定 IP
+
+```
+list_url = https://real-cdn.example.com/live/master.m3u8
+race_mode = 1
+race_ip = 1.2.3.4@real-cdn.example.com
+race_ip = 5.6.7.8@real-cdn.example.com
+```
+
+说明：`list_url` 只用来拉取播放列表；不需要配置 `url`（因为分片本身就是绝对地址）；两个 `race_ip` 会并发连接 `1.2.3.4` 和 `5.6.7.8`，同时都带上 `Host: real-cdn.example.com` 请求头，绕开 DNS 解析和 CDN 调度。
+
+### 示例 2：分片是相对路径，标准模式，多镜像轮询
+
+```
+list_url = https://origin.example.com/live/master.m3u8
+url = https://mirror1.example.com/live
+url = https://mirror2.example.com/live
+```
+
+说明：`list_url` 拉列表；实际下载会在 `mirror1`/`mirror2` 之间轮询，用 `url` 的值作为 base 和分片相对路径拼接。
+
+### 示例 3：分片是绝对地址，标准模式，希望强制走自己的中转域名
+
+```
+list_url = https://origin.example.com/live/master.m3u8
+url = https://relay.example.com
+```
+
+说明：`url` 不带路径，播放列表里分片自带的绝对地址会被 `relay.example.com` 覆盖域名（协议/端口也一并覆盖），path/query 保留分片原有的部分。
+
+### 示例 4：只有一个地址，最简配置
+
+```
+url = https://origin.example.com/live/master.m3u8
+```
+
+说明：不配 `list_url` 时，`url` 自动兼职列表源，一份配置两用。
+
+## 五、排错提示
+
+- 频道日志中出现 **"no download base configured for relative-path segment"**：分片是相对路径，但没有配置 `url`，请补充 `url`。
+- 频道日志中出现 **"skip url candidate: cannot override absolute segment host with a base that has a path"**：`url` 配置里带了路径，无法用于覆盖绝对地址分片，请为该场景单独配置不带路径的 `url`。
+- 频道日志中出现 **"must not include a protocol (scheme)"**：`race_host` 或 `race_ip` 的 `@host` 部分带了 `http://`/`https://` 前缀，这两处都只允许 `host[:port]`，协议前缀只能写在 `race_ip` 的地址部分。
+- 赛马模式下候选完全不生效、日志无报错：检查是否同时配置了 `race_ip`；只要 `race_ip` 非空，`url` 就不会参与竞速。
