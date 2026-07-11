@@ -518,7 +518,7 @@ impl Downloader {
 
         let mut futs = FuturesUnordered::new();
         for (server, host_override) in &candidates {
-            let url = match self.resolve_race_segment_url(server, &task.rel_path) {
+            let url = match resolve_segment_url(server, &task.rel_path) {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!(server, rel_path = %task.rel_path, error = %e, "skip invalid race candidate for this segment");
