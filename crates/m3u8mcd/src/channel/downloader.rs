@@ -105,12 +105,51 @@ impl Downloader {
         })
     }
 
-    /// 某个赛马候选实际使用的 Host 请求头：候选自带 host（`ip@host` 写法）优先，
-    /// 其次是全局显式配置的 race_host；两者都没有时返回 None（视为纯 IP 请求，
-    /// 不发送任何 Host 覆盖）。不再有"自动从 list_url/media playlist 域名推断"这一级兜底——
-    /// 赛马模式下的 Host 完全由用户显式配置决定，避免出现"没配却被隐式设置"的静默行为。
-    fn effective_race_host(&self, per_target_host: &Option<String>) -> Option<String> {
-        per_target_host.clone().or_else(|| self.configured_race_host.clone())
+    /// 某个赛马候选实际使用的 Host 请求头，按级联优先级确定：
+    /// 1. 候选自带 `@host`（最高优先级）；
+    /// 2. 全局显式配置的 race_host；
+    /// 3. 最后一级默认值，按分片路径类型分两种情况：
+    ///    - 分片是绝对地址（如 `https://cdn6.cc.cd/api/amty/234028X`）：
+    ///      默认值是**分片自己带的这个绝对地址的域名**（如 `cdn6.cc.cd`），
+    ///      而不是 `url` 的域名——`url` 往往是转发/中转服务，跟分片真正的源站是两个
+    ///      不同的服务，拿 `url` 的域名当 Host 语义上对不上、大概率连不通。
+    ///      `url`（若也配置了）在这里是"优先级更高的覆盖"，而不是"默认值本身"：
+    ///      默认值永远是分片自带地址；只有当 race_host/race_ip@host 更高优先级的值缺失、
+    ///      且用户显式希望走自己的中转 `url` 时，才需要用 race_host/race_ip@host 顶上去，
+    ///      而不是指望这里静默换成 url 的域名。
+    ///    - 分片是相对路径：分片本身不带任何域名信息，没有"分片自带地址"可用，
+    ///      这种情况下退回用 `url`（mirror_pool）的域名兜底。
+    /// 4. 都没有：返回 None，视为纯 IP/域名请求，不发送 Host 覆盖。
+    fn effective_race_host(&self, per_target_host: &Option<String>, rel_path: &str) -> Option<String> {
+        per_target_host
+            .clone()
+            .or_else(|| self.configured_race_host.clone())
+            .or_else(|| {
+                if Self::is_absolute_url(rel_path) {
+                    Self::host_of(rel_path)
+                } else {
+                    self.url_domain_default()
+                }
+            })
+    }
+
+    /// 从一个绝对 URL 里取出 host[:port] 部分（Host 请求头不允许带协议）。
+    fn host_of(abs_url: &str) -> Option<String> {
+        let u = url::Url::parse(abs_url).ok()?;
+        let host = u.host_str()?;
+        Some(match u.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.to_string(),
+        })
+    }
+
+    /// 从 mirror_pool（即 `url` 配置）的第一个候选里取出纯域名部分，
+    /// 作为赛马模式下"相对路径分片、url 的域名作为默认值"这条规则的来源。
+    /// mirror_pool 为空（只填了 list_url，没配 url）时返回 None。
+    fn url_domain_default(&self) -> Option<String> {
+        let first = self.mirror_pool.available_servers().into_iter().next()?;
+        let host_only = strip_path(&first).ok()?;
+        Self::host_of(&host_only)
     }
 
     pub fn is_overloaded(&self) -> bool {
@@ -401,7 +440,7 @@ impl Downloader {
     /// 赛马候选统一是"纯连接目标"，不带 path（mirror_pool 里的 url 候选先用
     /// strip_path 剥离掉可能带的路径），与相对/绝对路径无关，和 mirror_pool 里
     /// 候选来源也无关——这是问题1修复时就统一好的设计，这里延续。
-    fn build_race_candidates(&self) -> Vec<(String, Option<String>)> {
+    fn build_race_candidates(&self, rel_path: &str) -> Vec<(String, Option<String>)> {
         if !self.race_targets.is_empty() {
             return self
                 .race_targets
@@ -412,7 +451,7 @@ impl Downloader {
                     } else {
                         format!("http://{ip}")
                     };
-                    let host = self.effective_race_host(per_target_host);
+                    let host = self.effective_race_host(per_target_host, rel_path);
                     (base, host)
                 })
                 .collect();
@@ -439,7 +478,7 @@ impl Downloader {
     }
 
     async fn download_race(&self, task: &SegmentTask) -> anyhow::Result<Bytes> {
-        let candidates = self.build_race_candidates();
+        let candidates = self.build_race_candidates(&task.rel_path);
 
         if candidates.is_empty() {
             anyhow::bail!("no race candidates available (configure race_ip, or url as a fallback base)");
@@ -922,7 +961,7 @@ mod tests {
             vec!["9.9.9.9".to_string()],
             "",
         );
-        let candidates = d.build_race_candidates();
+        let candidates = d.build_race_candidates("seg1.ts");
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].0.contains("9.9.9.9"));
     }
@@ -935,7 +974,7 @@ mod tests {
             vec![],
             "",
         );
-        let candidates = d.build_race_candidates();
+        let candidates = d.build_race_candidates("seg1.ts");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, "https://cdn.example.com/");
         assert_eq!(candidates[0].1, None);
@@ -950,25 +989,74 @@ mod tests {
             vec![],
             "override.host.com",
         );
-        let candidates = d.build_race_candidates();
+        let candidates = d.build_race_candidates("seg1.ts");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, "https://override.host.com:8443/");
     }
 
     #[test]
     fn race_candidates_pure_ip_no_host_when_nothing_configured() {
-        // 只填了 race_ip，没填 race_host、没填 @host：视为纯 IP 请求，Host 头为 None
-        // （不再有"自动从 list_url 推断"的隐式兜底）。
+        // 只填了 race_ip，没填 race_host、没填 @host、也没配 url，分片还是相对路径：
+        // 没有任何域名可以兜底（分片本身也不带域名信息），视为纯 IP 请求，Host 头为 None。
         let d = make_downloader(vec![], vec!["1.2.3.4".to_string()], "");
-        let candidates = d.build_race_candidates();
+        let candidates = d.build_race_candidates("seg1.ts");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].1, None);
+    }
+
+    #[test]
+    fn race_candidates_absolute_segment_falls_back_to_its_own_domain_not_url() {
+        // 复现真实场景并修正：配置了 race_ip（作为连接目标）+ url（转发/中转服务，
+        // 跟分片真正的源站是两个不同域名），race_ip 没带 @host、也没配全局 race_host，
+        // 分片本身是绝对地址（如 CDN 直接返回 https://cdn6.cc.cd/api/amty/234028X）。
+        // 兜底 Host 应该是分片自己带的域名（cdn6.cc.cd），而不是 url 的域名
+        // （ts.321288.xyz，这是转发服务自己的域名，跟分片真正的源站语义对不上）。
+        let d = make_downloader(
+            vec!["https://ts.321288.xyz/?url=https://cdn.qd.je/163189.php".to_string()],
+            vec!["https://172.64.53.54".to_string(), "https://cdn6.cc.cd".to_string()],
+            "",
+        );
+        let candidates = d.build_race_candidates("https://cdn6.cc.cd/api/amty/234028X");
+        assert_eq!(candidates.len(), 2);
+        // 连接目标依然是各自的 race_ip 地址
+        assert!(candidates[0].0.contains("172.64.53.54"));
+        assert!(candidates[1].0.contains("cdn6.cc.cd"));
+        // 两个候选的 Host 头都兜底成了分片自带地址的域名，不是 url 的域名
+        assert_eq!(candidates[0].1, Some("cdn6.cc.cd".to_string()));
+        assert_eq!(candidates[1].1, Some("cdn6.cc.cd".to_string()));
+    }
+
+    #[test]
+    fn race_candidates_relative_segment_falls_back_to_url_domain() {
+        // 分片是相对路径时，分片本身不带任何域名信息，没有"分片自带地址"可用，
+        // 这种情况下才应该退回用 url 的域名兜底（相对路径场景专属的规则，与绝对路径不同）。
+        let d = make_downloader(
+            vec!["https://ts.321288.xyz/list.m3u8".to_string()],
+            vec!["https://172.64.53.54".to_string()],
+            "",
+        );
+        let candidates = d.build_race_candidates("seg1.ts");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1, Some("ts.321288.xyz".to_string()));
+    }
+
+    #[test]
+    fn race_candidates_per_target_host_still_wins_over_segment_own_domain() {
+        // race_ip 自带 @host 时，优先级依然最高，不会被"分片自带域名"这层兜底覆盖掉。
+        let d = make_downloader(
+            vec!["https://ts.321288.xyz/list.m3u8".to_string()],
+            vec!["https://172.64.53.54@mirror.cdn.com".to_string()],
+            "",
+        );
+        let candidates = d.build_race_candidates("https://cdn6.cc.cd/api/amty/234028X");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1, Some("mirror.cdn.com".to_string()));
     }
 
     #[test]
     fn race_candidates_empty_when_nothing_configured() {
         // 只填了 list_url，url 和 race_ip 都没填：没有任何候选可竞速。
         let d = make_downloader(vec![], vec![], "");
-        assert!(d.build_race_candidates().is_empty());
+        assert!(d.build_race_candidates("seg1.ts").is_empty());
     }
 }
