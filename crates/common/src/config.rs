@@ -84,6 +84,77 @@ pub struct ChannelConfig {
     pub ffmpeg_output_args: Vec<String>,
 }
 
+/// 校验一个"候选覆盖"字符串是否为合法的 `scheme://host[:port]` 或 `host[:port]` 形式
+/// （不允许带 path/query/fragment）。
+///
+/// 归一化/校验逻辑：从 `downloader.rs` 搬迁到这里（配置层），职责是"拿到用户配置的
+/// 原始字符串，做格式校验"，与运行时下载逻辑分离——下载器只应拿到已经校验干净的值。
+pub fn validate_host_only(entry: &str) -> Result<(), String> {
+    let has_scheme = entry.starts_with("http://") || entry.starts_with("https://");
+    let host_port_part = if has_scheme {
+        entry.split_once("://").map(|(_, rest)| rest).unwrap_or(entry)
+    } else {
+        entry
+    };
+    if host_port_part.contains('?') || host_port_part.contains('#') {
+        return Err("must not contain a query/fragment; only scheme/host/port are allowed".to_string());
+    }
+    // url::Url 序列化带 scheme 的地址时，即使 path 为空也会保留末尾的单个 "/"
+    // （strip_path 的输出就是这种形式，如 "https://6.cdn.hi.hn/"）。
+    // 这种"只有一个尾部 /、没有其它路径内容"的情况视为合法的纯 host，
+    // 只有出现真正的路径内容（"/"后面还有字符，或"/"出现在中间）才判定为带 path。
+    let trimmed = host_port_part.strip_suffix('/').unwrap_or(host_port_part);
+    if trimmed.is_empty() {
+        return Err("empty host".to_string());
+    }
+    if trimmed.contains('/') {
+        return Err("must not contain a path; only scheme/host/port are allowed".to_string());
+    }
+    Ok(())
+}
+
+/// 只把 base 的 scheme://host[:port] 部分保留，丢弃 path/query/fragment。
+/// 用于赛马模式下把 mirror_pool 自动派生的、带 path 的 base（如
+/// "https://6.cdn.hi.hn/163189"）统一收窄成"纯连接目标"。
+/// 从 `downloader.rs` 搬迁到配置层。
+pub fn strip_path(base: &str) -> Result<String, String> {
+    let mut url = url::Url::parse(base).map_err(|e| format!("race candidate base '{base}' is not a valid url: {e}"))?;
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+/// 校验 race_host（全局配置）或 race_ip 上 `@host` 部分的值：不允许带协议（scheme），
+/// HTTP Host 请求头本身不支持 scheme，带了协议的配置属于误用。
+/// 校验不通过时记录 warn 并返回 None（等同于没有配置这个值，不做静默接受也不 panic）。
+/// 从 `downloader.rs` 搬迁到配置层，在配置加载阶段就完成校验/归一化。
+pub fn validate_race_host_value(raw: &str, field_name: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        tracing::warn!(field_name, value = trimmed, "must not include a protocol (scheme); only host[:port] is allowed for a Host header value, ignoring this value");
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// 解析单条 race_ip 配置项，支持两种写法：
+/// - `1.2.3.4`：纯地址，不携带专属 host。
+/// - `1.2.3.4@mirror2.cdn.com`：地址携带专属 host（Host 覆盖）。
+/// 从 `downloader.rs` 搬迁到配置层。
+pub fn parse_race_ip_entry(entry: &str) -> (String, Option<String>) {
+    match entry.rsplit_once('@') {
+        Some((addr, host)) if !host.trim().is_empty() => {
+            (addr.trim().to_string(), Some(host.trim().to_string()))
+        }
+        Some((addr, _)) => (addr.trim().to_string(), None),
+        None => (entry.trim().to_string(), None),
+    }
+}
+
 impl ChannelConfig {
     /// 实际用于拉取列表（Poller）的源地址：
     /// 优先使用独立配置的 list_urls，未配置时回退到 urls（向后兼容旧配置，
@@ -117,6 +188,28 @@ impl ChannelConfig {
         } else {
             &self.downloader_http_headers
         }
+    }
+
+    /// 归一化后的 race_host：校验/归一化在配置层一次性完成
+    /// （不允许带协议，HTTP Host 请求头本身不支持 scheme），
+    /// 不合法的配置在这里就被过滤掉并记录 warn，Downloader 直接拿到干净值，
+    /// 不需要在运行时（Downloader::new）重复做同样的校验。
+    pub fn effective_race_host(&self) -> Option<String> {
+        validate_race_host_value(&self.race_host, "race_host")
+    }
+
+    /// 归一化后的 race_targets：解析每条 race_ip 的 `地址[@host]` 写法，
+    /// 并校验 `@host` 部分不带协议。同样是配置层一次性完成的归一化，
+    /// 从 `downloader.rs` 的构造逻辑中搬迁过来。
+    pub fn effective_race_targets(&self) -> Vec<(String, Option<String>)> {
+        self.race_ips
+            .iter()
+            .map(|entry| {
+                let (addr, host) = parse_race_ip_entry(entry);
+                let host = host.and_then(|h| validate_race_host_value(&h, "race_ip @host"));
+                (addr, host)
+            })
+            .collect()
     }
 }
 
@@ -295,4 +388,107 @@ pub fn diff_channels(old: &Config, new: &Config) -> ConfigDiff {
         }
     }
     diff
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+
+    #[test]
+    fn validate_host_only_rejects_path() {
+        assert!(validate_host_only("cdn2.example.com/live").is_err());
+        assert!(validate_host_only("https://cdn2.example.com/live").is_err());
+        assert!(validate_host_only("cdn2.example.com").is_ok());
+        assert!(validate_host_only("https://cdn2.example.com:8443").is_ok());
+    }
+
+    #[test]
+    fn strip_path_removes_path_query_fragment() {
+        assert_eq!(
+            strip_path("https://6.cdn.hi.hn/163189?x=1#frag").unwrap(),
+            "https://6.cdn.hi.hn/"
+        );
+    }
+
+    #[test]
+    fn validate_race_host_rejects_scheme() {
+        assert_eq!(validate_race_host_value("mirror2.cdn.com", "race_host"), Some("mirror2.cdn.com".to_string()));
+        assert_eq!(validate_race_host_value("mirror2.cdn.com:8443", "race_host"), Some("mirror2.cdn.com:8443".to_string()));
+        assert_eq!(validate_race_host_value("https://mirror2.cdn.com", "race_host"), None);
+        assert_eq!(validate_race_host_value("", "race_host"), None);
+        assert_eq!(validate_race_host_value("   ", "race_host"), None);
+    }
+
+    #[test]
+    fn parse_race_ip_entry_plain() {
+        assert_eq!(parse_race_ip_entry("1.2.3.4"), ("1.2.3.4".to_string(), None));
+    }
+
+    #[test]
+    fn parse_race_ip_entry_with_host() {
+        assert_eq!(
+            parse_race_ip_entry("1.2.3.4@mirror2.cdn.com"),
+            ("1.2.3.4".to_string(), Some("mirror2.cdn.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_race_ip_entry_trailing_at_ignored() {
+        assert_eq!(parse_race_ip_entry("1.2.3.4@ "), ("1.2.3.4".to_string(), None));
+    }
+
+    #[test]
+    fn channel_config_effective_race_host_filters_scheme() {
+        let mut ch = default_test_channel();
+        ch.race_host = "https://bad.example.com".to_string();
+        assert_eq!(ch.effective_race_host(), None);
+        ch.race_host = "good.example.com:8443".to_string();
+        assert_eq!(ch.effective_race_host(), Some("good.example.com:8443".to_string()));
+    }
+
+    #[test]
+    fn channel_config_effective_race_targets_parses_and_validates() {
+        let mut ch = default_test_channel();
+        ch.race_ips = vec!["1.2.3.4".to_string(), "5.6.7.8@mirror.cdn.com".to_string()];
+        let targets = ch.effective_race_targets();
+        assert_eq!(targets, vec![
+            ("1.2.3.4".to_string(), None),
+            ("5.6.7.8".to_string(), Some("mirror.cdn.com".to_string())),
+        ]);
+    }
+
+    fn default_test_channel() -> ChannelConfig {
+        ChannelConfig {
+            id: "test".to_string(),
+            enabled: true,
+            name: "test".to_string(),
+            urls: vec![],
+            protocol: Protocol::Rtp,
+            addr: "239.0.0.1".to_string(),
+            port: 1234,
+            iface: "lan".to_string(),
+            ttl: 4,
+            pkt_size: 1316,
+            buffer_size: 1_048_576,
+            threads: 4,
+            cache_window: 3,
+            max_segments: 5,
+            hls_segments: 3,
+            http_port: None,
+            http_path: "/live".to_string(),
+            use_downloader: true,
+            race_mode: false,
+            race_ips: vec![],
+            race_host: String::new(),
+            http_headers: vec![],
+            poller_http_headers: vec![],
+            downloader_http_headers: vec![],
+            list_urls: vec![],
+            list_poll_interval_secs: 0.0,
+            list_proxy: String::new(),
+            download_proxy: String::new(),
+            ffmpeg_input_args: vec![],
+            ffmpeg_output_args: vec![],
+        }
+    }
 }
