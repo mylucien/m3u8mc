@@ -7,6 +7,14 @@
 use super::cache::SegmentCache;
 use super::mirror_pool::MirrorPool;
 use bytes::{Bytes, BytesMut};
+// 配置校验/归一化逻辑（validate_race_host_value、validate_host_only、strip_path、
+// parse_race_ip_entry）已按分层原则搬迁到 common::config，这里只是使用方，
+// 不再维护重复实现。strip_path/validate_host_only 仍在运行时路径中使用
+// （赛马候选净化、绝对路径 host 覆盖校验）；parse_race_ip_entry/validate_race_host_value
+// 的运行时调用已随 Downloader::new 签名变更移到调用方（ChannelConfig::effective_race_*），
+// 这里仅在单测中直接引用以验证行为。
+#[allow(unused_imports)]
+use m3u8mc_common::config::{parse_race_ip_entry, strip_path, validate_host_only, validate_race_host_value};
 use dashmap::DashSet;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -63,13 +71,18 @@ pub struct Downloader {
 }
 
 impl Downloader {
+    /// `race_targets` 与 `race_host` 由调用方通过
+    /// [`m3u8mc_common::config::ChannelConfig::effective_race_targets`] /
+    /// [`m3u8mc_common::config::ChannelConfig::effective_race_host`] 在配置加载阶段
+    /// 完成解析与校验（不允许带协议等），这里不再重复做同样的字符串校验/解析——
+    /// Downloader 只消费已经归一化干净的值。
     pub fn new(
         mirror_pool: Arc<MirrorPool>,
         cache: Arc<SegmentCache>,
         strategy: DownloadStrategy,
         threads: usize,
-        race_ips: Vec<String>,
-        race_host: &str,
+        race_targets: Vec<(String, Option<String>)>,
+        race_host: Option<String>,
         http_headers: &[String],
         proxy: &str,
     ) -> Arc<Self> {
@@ -81,16 +94,6 @@ impl Downloader {
             .default_headers(default_headers.clone());
         builder = apply_proxy(builder, proxy, "downloader");
         let client = builder.build().expect("failed to build reqwest client");
-        // race_host 只能是 host[:port]，不允许带协议（HTTP Host 请求头本身不支持 scheme）。
-        let configured_race_host = validate_race_host_value(race_host, "race_host");
-        let race_targets: Vec<(String, Option<String>)> = race_ips
-            .iter()
-            .map(|entry| {
-                let (addr, host) = parse_race_ip_entry(entry);
-                let host = host.and_then(|h| validate_race_host_value(&h, "race_ip @host"));
-                (addr, host)
-            })
-            .collect();
         Arc::new(Downloader {
             client,
             mirror_pool,
@@ -100,7 +103,7 @@ impl Downloader {
             strategy,
             threads: threads.max(1),
             race_targets,
-            configured_race_host,
+            configured_race_host: race_host,
             overloaded: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -152,6 +155,32 @@ impl Downloader {
         Self::host_of(&host_only)
     }
 
+    /// race_ip 不带协议时使用的默认协议，设计理念是"尽量保持直播源原来的信息"，
+    /// 与 [`Self::effective_race_host`] 的默认值来源完全对称，按 rel_path 是否
+    /// 绝对路径分两种情况：
+    /// - 分片是绝对地址：用分片自带地址的 scheme（该地址是真正的下载源）；
+    /// - 分片是相对路径：分片本身不带协议信息，退回用 `url`（mirror_pool）
+    ///   第一个候选的 scheme 兜底。
+    /// 两者都取不到时（理论上不会真正走到这里：相对路径 + 没配 url 的组合下，
+    /// build_race_candidates 会在没有任何候选时提前返回空列表，见 `race_candidates_empty_when_nothing_configured`），
+    /// 兜底为 "http"。
+    fn default_race_scheme(&self, rel_path: &str) -> &'static str {
+        let scheme = if Self::is_absolute_url(rel_path) {
+            url::Url::parse(rel_path).ok().map(|u| u.scheme().to_string())
+        } else {
+            self.mirror_pool
+                .available_servers()
+                .into_iter()
+                .next()
+                .and_then(|s| url::Url::parse(&s).ok())
+                .map(|u| u.scheme().to_string())
+        };
+        match scheme.as_deref() {
+            Some("https") => "https",
+            _ => "http",
+        }
+    }
+
     pub fn is_overloaded(&self) -> bool {
         self.overloaded.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -200,22 +229,25 @@ impl Downloader {
 
     /// 将 server_base 与 rel_path 拼接为完整 URL。
     ///
-    /// 按 HLS 规范（RFC 8216 §4.1）处理两种相对路径形式：
+    /// 严格按 RFC 3986 §5.3 的标准 URL merge 语义（与 url::Url::join、
+    /// ffmpeg 的 ff_make_absolute_url()、浏览器行为完全一致），不做任何
+    /// 额外的"补斜杠 / 强制当目录"归一化：
     /// - 根路径相对（以 `/` 开头，如 `/api/amty/2283368`）：
     ///   相对于 origin（scheme://host），而非 media playlist 目录。
     ///   示例：base="https://cdn.hi.hn/163189" + rel="/api/amty/1"
     ///         → "https://cdn.hi.hn/api/amty/1"
-    /// - 目录相对（不以 `/` 开头，如 `seg100.ts`）：
-    ///   拼在 base 目录后，与原行为一致。
+    /// - 普通相对路径（不以 `/` 开头，如 `seg100.ts`）：
+    ///   取 base 路径中最后一个 `/` 之前的部分（即把最后一段当"文件名"丢弃），
+    ///   再拼上相对路径。base 是否以 `/` 结尾，决定最后一段是被当成"目录"
+    ///   保留还是被当成"文件"替换掉——这是标准语义，也是唯一判断依据：
+    ///     base="https://cdn.example.com/live"（无尾斜杠，视为文件）
+    ///       + "seg100.ts" → "https://cdn.example.com/seg100.ts"（"live"被替换）
+    ///     base="https://cdn.example.com/live/"（有尾斜杠，视为目录）
+    ///       + "seg100.ts" → "https://cdn.example.com/live/seg100.ts"
+    ///   若用户希望 base 被当作目录，需要自己在配置里给 url 补上尾斜杠；
+    ///   这是数据层面的写法问题，代码不再替用户做归一化猜测。
     fn build_url(server_base: &str, rel_path: &str) -> String {
-        // 尝试用 url::Url::join 做规范解析（最准确）
-        // server_base 可能是目录形式（无尾 /）需补上 / 才能让 join 在正确目录下工作
-        let base_with_slash = if server_base.ends_with('/') {
-            server_base.to_string()
-        } else {
-            format!("{}/", server_base)
-        };
-        if let Ok(base_url) = url::Url::parse(&base_with_slash) {
+        if let Ok(base_url) = url::Url::parse(server_base) {
             if let Ok(joined) = base_url.join(rel_path) {
                 return joined.to_string();
             }
@@ -449,7 +481,7 @@ impl Downloader {
                     let base = if ip.starts_with("http://") || ip.starts_with("https://") {
                         ip.clone()
                     } else {
-                        format!("http://{ip}")
+                        format!("{}://{ip}", self.default_race_scheme(rel_path))
                     };
                     let host = self.effective_race_host(per_target_host, rel_path);
                     (base, host)
@@ -486,7 +518,7 @@ impl Downloader {
 
         let mut futs = FuturesUnordered::new();
         for (server, host_override) in &candidates {
-            let url = match resolve_segment_url(server, &task.rel_path) {
+            let url = match self.resolve_race_segment_url(server, &task.rel_path) {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!(server, rel_path = %task.rel_path, error = %e, "skip invalid race candidate for this segment");
@@ -548,46 +580,6 @@ impl Downloader {
     }
 }
 
-/// 校验一个"候选覆盖"字符串是否为合法的 `scheme://host[:port]` 或 `host[:port]` 形式
-/// （不允许带 path/query/fragment）。用于 Downloader::new 构造时预先过滤 url_overrides，
-/// 也用于 apply_host_override 内部的路径校验共享同一套判断标准。
-fn validate_host_only(entry: &str) -> anyhow::Result<()> {
-    let has_scheme = entry.starts_with("http://") || entry.starts_with("https://");
-    let host_port_part = if has_scheme {
-        entry.split_once("://").map(|(_, rest)| rest).unwrap_or(entry)
-    } else {
-        entry
-    };
-    if host_port_part.contains('?') || host_port_part.contains('#') {
-        anyhow::bail!("must not contain a query/fragment; only scheme/host/port are allowed");
-    }
-    // url::Url 序列化带 scheme 的地址时，即使 path 为空也会保留末尾的单个 "/"
-    // （strip_path 的输出就是这种形式，如 "https://6.cdn.hi.hn/"）。
-    // 这种"只有一个尾部 /、没有其它路径内容"的情况视为合法的纯 host，
-    // 只有出现真正的路径内容（"/"后面还有字符，或"/"出现在中间）才判定为带 path。
-    let trimmed = host_port_part.strip_suffix('/').unwrap_or(host_port_part);
-    if trimmed.is_empty() {
-        anyhow::bail!("empty host");
-    }
-    if trimmed.contains('/') {
-        anyhow::bail!("must not contain a path; only scheme/host/port are allowed");
-    }
-    Ok(())
-}
-
-/// 只把 base 的 scheme://host[:port] 部分保留，丢弃 path/query/fragment。
-/// 用于赛马模式下把 mirror_pool 自动派生的、带 path 的 base（如
-/// "https://6.cdn.hi.hn/163189"）统一收窄成"纯连接目标"，
-/// 使其与显式配置的 race_ip 候选走同一套逻辑（不再区分候选来源）。
-fn strip_path(base: &str) -> anyhow::Result<String> {
-    let mut url = url::Url::parse(base)
-        .map_err(|e| anyhow::anyhow!("race candidate base '{base}' is not a valid url: {e}"))?;
-    url.set_path("");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
-}
-
 /// 用 override_cfg（"scheme://host[:port]" 或 "host[:port]"）只替换 orig_abs_url 的
 /// scheme/host/port 三项，path/query/fragment 原样保留。
 ///
@@ -598,7 +590,7 @@ fn strip_path(base: &str) -> anyhow::Result<String> {
 /// - override_cfg 若带 path/query/fragment（即出现 `/`、`?`、`#`），视为配置错误，
 ///   直接返回 Err，不做静默降级或忽略，避免用户配置了却在运行时被悄悄丢弃。
 fn apply_host_override(orig_abs_url: &str, override_cfg: &str) -> anyhow::Result<String> {
-    validate_host_only(override_cfg)?;
+    validate_host_only(override_cfg).map_err(|e| anyhow::anyhow!(e))?;
 
     let mut url = url::Url::parse(orig_abs_url)
         .map_err(|e| anyhow::anyhow!("segment url is not a valid absolute url: {orig_abs_url}: {e}"))?;
@@ -658,21 +650,6 @@ fn resolve_segment_url(candidate_base: &str, rel_path: &str) -> anyhow::Result<S
     }
 }
 
-/// 校验 race_host（全局配置）或 race_ip 上 `@host` 部分的值：不允许带协议（scheme），
-/// HTTP Host 请求头本身不支持 scheme，带了协议的配置属于误用。
-/// 校验不通过时记录 warn 并返回 None（等同于没有配置这个值，不做静默接受也不 panic）。
-fn validate_race_host_value(raw: &str, field_name: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        tracing::warn!(field_name, value = trimmed, "must not include a protocol (scheme); only host[:port] is allowed for a Host header value, ignoring this value");
-        return None;
-    }
-    Some(trimmed.to_string())
-}
-
 /// 只替换 base（"scheme://host[:port]"，不带 path，通常是 strip_path 的输出）的域名部分，
 /// scheme 和 port 保持不变——除非 host_override 自己带了端口，这种情况下端口才会被替换。
 /// host_override 不允许带协议（由调用方或这里校验），也不允许带 path。
@@ -727,26 +704,6 @@ pub fn apply_proxy(builder: reqwest::ClientBuilder, proxy: &str, label: &str) ->
     }
 }
 
-/// 解析单条 race_ip 配置项，支持两种写法：
-/// - `1.2.3.4`：纯地址，不携带专属 host，后续按"全局 race_host → 自动推断"回退。
-/// - `1.2.3.4@mirror2.cdn.com`：地址携带专属 host，用于标准模式镜像池存在
-///   多个不同域名时，让每个赛马候选 IP 精确对应自己的域名，避免多域名场景下
-///   全部候选被套用同一个 Host 导致目标服务器认错域名。
-/// 地址部分本身若已经是 `http://` / `https://` 开头的完整 URL，`@host` 依然按最后一个
-/// `@` 切分（IPv6 裸地址不含 `@`，不会误切）。
-fn parse_race_ip_entry(entry: &str) -> (String, Option<String>) {
-    match entry.rsplit_once('@') {
-        Some((addr, host)) if !host.trim().is_empty() => {
-            (addr.trim().to_string(), Some(host.trim().to_string()))
-        }
-        // '@' 存在但 host 为空/空白（如 "1.2.3.4@" 或 "1.2.3.4@ "）：
-        // 取 '@' 前的部分作为 addr，忽略空 host。
-        Some((addr, _)) => (addr.trim().to_string(), None),
-        // 没有 '@'：整体就是 addr。
-        None => (entry.trim().to_string(), None),
-    }
-}
-
 /// 把 UCI list http_header 的字符串列表解析为 reqwest HeaderMap。
 /// 每条格式为 "Header-Name: value"，解析失败的条目记录 warn 后跳过。
 ///
@@ -796,9 +753,19 @@ mod tests {
 
     #[test]
     fn build_url_relative_no_slash() {
-        // 普通相对路径（不以 / 开头）：拼在 base 目录后
+        // 方案A：base 无尾斜杠时按标准 RFC 3986 merge 语义，最后一段被当"文件名"替换掉，
+        // 而不是无脑当目录拼接（"live" 被 "seg100.ts" 替换）。
         assert_eq!(
             Downloader::build_url("https://cdn.example.com/live", "seg100.ts"),
+            "https://cdn.example.com/seg100.ts"
+        );
+    }
+
+    #[test]
+    fn build_url_relative_with_trailing_slash_is_directory() {
+        // base 显式以 / 结尾时才被当作目录，分片拼在其后
+        assert_eq!(
+            Downloader::build_url("https://cdn.example.com/live/", "seg100.ts"),
             "https://cdn.example.com/live/seg100.ts"
         );
     }
@@ -834,10 +801,10 @@ mod tests {
 
     #[test]
     fn resolve_relative_path_unaffected() {
-        // 相对路径：行为与优化前的 build_url 完全一致，零回归
+        // 相对路径：沿用 build_url 的标准 join 语义（方案A）
         assert_eq!(
             resolve_segment_url("https://cdn.example.com/live", "seg100.ts").unwrap(),
-            "https://cdn.example.com/live/seg100.ts"
+            "https://cdn.example.com/seg100.ts"
         );
         assert_eq!(
             resolve_segment_url("https://6.cdn.hi.hn/163189", "/api/amty/2283368").unwrap(),
@@ -937,15 +904,27 @@ mod tests {
     }
 
     /// 构造一个仅用于纯逻辑测试的 Downloader（不会真的发起网络请求）。
+    /// `race_ips`/`race_host` 仍按原始 UCI 字符串写法传入，这里在测试内部
+    /// 用与 `ChannelConfig::effective_race_targets`/`effective_race_host` 相同的
+    /// 归一化函数解析，模拟真实调用方（config 层）的行为。
     fn make_downloader(url_bases: Vec<String>, race_ips: Vec<String>, race_host: &str) -> Arc<Downloader> {
         let mirror_pool = MirrorPool::new(url_bases);
         let cache = SegmentCache::new(8, Duration::from_secs(30));
+        let race_targets: Vec<(String, Option<String>)> = race_ips
+            .iter()
+            .map(|entry| {
+                let (addr, host) = parse_race_ip_entry(entry);
+                let host = host.and_then(|h| validate_race_host_value(&h, "race_ip @host"));
+                (addr, host)
+            })
+            .collect();
+        let race_host = validate_race_host_value(race_host, "race_host");
         Downloader::new(
             mirror_pool,
             cache,
             DownloadStrategy::Race,
             1,
-            race_ips,
+            race_targets,
             race_host,
             &[],
             "",
@@ -1051,6 +1030,40 @@ mod tests {
         let candidates = d.build_race_candidates("https://cdn6.cc.cd/api/amty/234028X");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].1, Some("mirror.cdn.com".to_string()));
+    }
+
+    #[test]
+    fn race_candidates_scheme_defaults_to_absolute_segment_scheme() {
+        // race_ip 不带协议 + 分片是绝对地址（https）：候选协议应跟随分片自身的
+        // scheme，而不是写死 http。
+        let d = make_downloader(vec![], vec!["1.2.3.4".to_string()], "");
+        let candidates = d.build_race_candidates("https://cdn6.cc.cd/api/amty/234028X");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "https://1.2.3.4");
+    }
+
+    #[test]
+    fn race_candidates_scheme_defaults_to_url_scheme_for_relative_segment() {
+        // race_ip 不带协议 + 分片是相对路径 + 配置了 url（https）：候选协议
+        // 跟随 url 的 scheme 兜底，而不是写死 http。
+        let d = make_downloader(
+            vec!["https://ts.321288.xyz/list.m3u8".to_string()],
+            vec!["1.2.3.4".to_string()],
+            "",
+        );
+        let candidates = d.build_race_candidates("seg1.ts");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "https://1.2.3.4");
+    }
+
+    #[test]
+    fn race_candidates_scheme_falls_back_to_http_when_segment_is_plain_http() {
+        // 分片本身就是 http 的绝对地址时，候选协议也应是 http（沿用分片信息，
+        // 而不是意外升级成 https）。
+        let d = make_downloader(vec![], vec!["1.2.3.4".to_string()], "");
+        let candidates = d.build_race_candidates("http://cdn6.cc.cd/api/amty/234028X");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "http://1.2.3.4");
     }
 
     #[test]
