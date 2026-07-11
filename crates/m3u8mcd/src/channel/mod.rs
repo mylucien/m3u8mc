@@ -72,8 +72,8 @@ impl ChannelHandle {
             Arc::clone(&cache),
             strategy,
             config.threads,
-            config.race_ips.clone(),
-            &config.race_host,
+            config.effective_race_targets(),
+            config.effective_race_host(),
             config.effective_downloader_headers(),
             &config.download_proxy,
         );
