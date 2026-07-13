@@ -267,30 +267,33 @@ impl Downloader {
 
     /// 1.8.2 标准模式单分片下载决策流程。
     ///
-    /// 问题2 修复后的完整语义（list_url 与 url 职责彻底分离）：
+    /// list_url 与 url 职责彻底分离：
     /// - mirror_pool 的内容始终且只来自 ChannelConfig.urls（即配置里的 `url`），
     ///   不再由 Poller 解析 media playlist 目录动态派生——list_url 只负责拉列表。
     /// - 相对路径分片：必须有 mirror_pool（即必须配置了 `url`）才能拼出下载地址；
-    ///   只填 list_url 不填 url 时,mirror_pool 为空，直接报错（"无下载分片路径参数"），
-    ///   不再像以前那样悄悄用 list_url 解析出的目录顶替。
-    /// - 绝对路径分片：mirror_pool 为空（只填 list_url）时，分片自带的绝对地址本身
-    ///   就是完整可用的下载地址，直接使用，不需要任何 base；mirror_pool 非空（填了 url）时，
-    ///   url 的 scheme/host/port 覆盖分片自带地址（优先级：url > 分片原始地址），
-    ///   通过 apply_host_override 实现，path/query 仍取自分片原地址。
+    ///   只填 list_url 不填 url 时,mirror_pool 为空，直接报错（"无下载分片路径参数"）。
+    /// - 绝对路径分片：不管 mirror_pool（url）是否配置，一律直接使用分片自带的
+    ///   绝对地址，不做任何 scheme/host/port 覆盖——源既然已经返回了绝对地址，
+    ///   标准模式下没有理由去改它；`url` 在标准模式下只服务于相对路径分片的拼接。
+    ///   如果需要主动更换连接目标（例如绕开某个不稳定节点），应使用赛马模式
+    ///   （race_ip/race_host），那才是覆盖分片地址这件事该发生的地方。
     async fn download_round_robin(&self, task: &SegmentTask) -> anyhow::Result<Bytes> {
-        let is_abs = Self::is_absolute_url(&task.rel_path);
-        let bases = self.mirror_pool.available_servers();
+        // 标准模式下，源既然已经返回绝对路径分片地址，就说明这条分片本该走这个地址，
+        // 直接使用，不受 url（mirror_pool）是否配置影响，也不覆盖 scheme/host/port——
+        // 覆盖分片自带的绝对地址在“最普通模式”下没有道理，只有赛马模式才需要主动
+        // 换连接目标（那是赛马模式存在的意义），标准模式应尊重源本身。
+        if Self::is_absolute_url(&task.rel_path) {
+            return self.download_from_server(&task.rel_path, self.threads).await;
+        }
 
+        // 相对路径分片本身不带域名信息，必须依赖 url（mirror_pool）才能拼出完整地址；
+        // 只填 list_url 不填 url 时 mirror_pool 为空，直接报错。
+        let bases = self.mirror_pool.available_servers();
         if bases.is_empty() {
-            if is_abs {
-                // 只填 list_url、没填 url：绝对路径分片自带完整地址，直接下载即可。
-                return self.download_from_server(&task.rel_path, self.threads).await;
-            } else {
-                anyhow::bail!(
-                    "no download base configured for relative-path segment: \
-                     list_url only fetches the playlist, please configure url as the download base"
-                );
-            }
+            anyhow::bail!(
+                "no download base configured for relative-path segment: \
+                 list_url only fetches the playlist, please configure url as the download base"
+            );
         }
 
         let primary = self
@@ -306,23 +309,8 @@ impl Downloader {
 
         let mut last_err = anyhow::anyhow!("no candidates");
         for server in &candidates {
-            // 相对路径：沿用 build_url（Url::join）拼接，url 里的 path 会被保留、参与拼接。
-            // 绝对路径：url 覆盖分片自带的 scheme/host/port（不动 path/query）；
-            // 若某个 url 候选本身带 path（典型的 "https://cdn.com/live" 写法），
-            // 对绝对路径分片而言这是没法覆盖的配置组合，resolve_segment_url 会报错，
-            // 这里记录 warn 后跳过换下一个候选，不影响其它合法候选。
-            let url = if is_abs {
-                match apply_host_override(&task.rel_path, server) {
-                    Ok(u) => u,
-                    Err(e) => {
-                        tracing::warn!(server, rel_path = %task.rel_path, error = %e, "skip url candidate: cannot override absolute segment host with a base that has a path");
-                        self.mirror_pool.report_task_failed(server);
-                        continue;
-                    }
-                }
-            } else {
-                Self::build_url(server, &task.rel_path)
-            };
+            // 沿用 build_url（Url::join）拼接，url 里的 path 会被保留、参与拼接。
+            let url = Self::build_url(server, &task.rel_path);
             match self.download_from_server(&url, self.threads).await {
                 Ok(data) => {
                     self.mirror_pool.report_success(server);
@@ -581,12 +569,18 @@ impl Downloader {
 }
 
 /// 用 override_cfg（"scheme://host[:port]" 或 "host[:port]"）只替换 orig_abs_url 的
-/// scheme/host/port 三项，path/query/fragment 原样保留。
+/// scheme/host/port，path/query/fragment 原样保留。
 ///
-/// 规则（问题1、问题2 共用）：
+/// 仅赛马模式（race_ip 分支）使用：赛马模式的意义就是主动换连接目标，覆盖分片
+/// 自带地址是它存在的理由。标准模式不再调用本函数——标准模式下绝对路径分片
+/// 直接使用源地址，不做任何覆盖（源既然给了绝对地址，普通模式没理由去动它）。
+///
+/// 规则：
 /// - override_cfg 不带 scheme（纯域名/IP，可选端口）→ 只换 host[:port]，协议沿用
 ///   orig_abs_url 原有 scheme；
-/// - override_cfg 带 `http://` 或 `https://` 前缀 → scheme/host/port 一并替换；
+/// - override_cfg 带 `http://` 或 `https://` 前缀 → scheme/host 一并替换；
+/// - override_cfg 未显式带端口 → 保留 orig_abs_url 原有端口（没设置就沿用源自带
+///   端口，与 override_domain_keep_scheme_port 语义一致，不再清空）；
 /// - override_cfg 若带 path/query/fragment（即出现 `/`、`?`、`#`），视为配置错误，
 ///   直接返回 Err，不做静默降级或忽略，避免用户配置了却在运行时被悄悄丢弃。
 fn apply_host_override(orig_abs_url: &str, override_cfg: &str) -> anyhow::Result<String> {
@@ -628,20 +622,24 @@ fn apply_host_override(orig_abs_url: &str, override_cfg: &str) -> anyhow::Result
     }
     url.set_host(Some(host))
         .map_err(|e| anyhow::anyhow!("url override '{override_cfg}' has invalid host: {e}"))?;
-    url.set_port(port_opt)
-        .map_err(|_| anyhow::anyhow!("url override '{override_cfg}' port not allowed for this scheme"))?;
+    // override_cfg 显式带端口才替换；未带端口时保留原地址（分片自身）的端口，
+    // 而不是清空——没设置就沿用源自带端口，是最小惊讶原则，与
+    // override_domain_keep_scheme_port 的语义保持一致。
+    if let Some(port) = port_opt {
+        url.set_port(Some(port))
+            .map_err(|_| anyhow::anyhow!("url override '{override_cfg}' port not allowed for this scheme"))?;
+    }
 
     Ok(url.to_string())
 }
 
 /// 统一入口：根据分片路径是相对还是绝对，决定走 join 还是 host 覆盖。
+/// 仅赛马模式（race_ip 分支）调用；标准模式绝对路径分片不经过这里，直接用源地址。
 ///
-/// - rel_path 为相对路径：沿用原有 Downloader::build_url（Url::join）逻辑，不受本次
-///   修复影响，标准模式与赛马模式在相对路径场景下的行为保持完全一致、零回归。
+/// - rel_path 为相对路径：走 Downloader::build_url（Url::join）拼接。
 /// - rel_path 为绝对 URL：调用 apply_host_override，只替换 scheme/host/port，
-///   candidate_base 必须是不带 path 的纯连接目标（调用方需保证，例如赛马模式在调用前
-///   已用 strip_path 剥离过路径；标准模式的 url_overrides 在 Downloader::new 构造时
-///   就已校验过不带路径）。
+///   candidate_base 必须是不带 path 的纯连接目标（调用方需保证，赛马模式在调用前
+///   已用 strip_path 剥离过路径）。
 fn resolve_segment_url(candidate_base: &str, rel_path: &str) -> anyhow::Result<String> {
     if Downloader::is_absolute_url(rel_path) {
         apply_host_override(rel_path, candidate_base)
@@ -653,8 +651,8 @@ fn resolve_segment_url(candidate_base: &str, rel_path: &str) -> anyhow::Result<S
 /// 只替换 base（"scheme://host[:port]"，不带 path，通常是 strip_path 的输出）的域名部分，
 /// scheme 和 port 保持不变——除非 host_override 自己带了端口，这种情况下端口才会被替换。
 /// host_override 不允许带协议（由调用方或这里校验），也不允许带 path。
-/// 用于赛马模式下 "race_host 覆盖 url 候选的域名" 这条规则：与 apply_host_override
-/// （用于分片绝对地址覆盖，端口缺省时会清空）语义不同，这里端口缺省时保留 base 原有端口。
+/// 用于赛马模式下 "race_host 覆盖 url 候选的域名" 这条规则：端口缺省时保留 base 原有端口，
+/// 与 apply_host_override 缺省时保留 orig_abs_url 原有端口的语义现已一致。
 fn override_domain_keep_scheme_port(base: &str, host_override: &str) -> anyhow::Result<String> {
     if host_override.starts_with("http://") || host_override.starts_with("https://") {
         anyhow::bail!("race_host must not include a protocol (scheme); only host[:port] is allowed");
@@ -832,6 +830,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, "https://5.6.7.8:8443/api/amty/234028X");
+    }
+
+    #[test]
+    fn resolve_absolute_path_override_no_port_keeps_original_port() {
+        // Bug 修复验证：候选（race_ip）没带端口时，应保留分片原有端口，
+        // 而不是静默清空成默认端口。
+        let result = resolve_segment_url(
+            "1.2.3.4",
+            "https://cdn6.cc.cd:8443/api/amty/234028X",
+        )
+        .unwrap();
+        assert_eq!(result, "https://1.2.3.4:8443/api/amty/234028X");
     }
 
     #[test]
