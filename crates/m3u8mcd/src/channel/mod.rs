@@ -9,13 +9,13 @@ pub mod poller;
 
 use cache::SegmentCache;
 use downloader::{DownloadStrategy, Downloader};
-use ffmpeg_supervisor::FfmpegSupervisor;
+use ffmpeg_supervisor::{FfmpegStatus, FfmpegSupervisor};
 use m3u8mc_common::config::ChannelConfig;
 use m3u8mc_common::protocol::ChannelStatus;
 use mirror_pool::MirrorPool;
 use poller::Poller;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -25,10 +25,13 @@ use tokio::task::JoinHandle;
 pub struct ChannelHandle {
     pub config: ChannelConfig,
     stop_tx: watch::Sender<bool>,
-    ffmpeg_status: Arc<ffmpeg_supervisor::FfmpegStatus>,
+    ffmpeg_status: Arc<FfmpegStatus>,
     cache: Option<Arc<SegmentCache>>,
     mirror_pool: Option<Arc<MirrorPool>>,
     downloader: Option<Arc<Downloader>>,
+    /// 纯代理加速模式（proxy_only）下，异步解析出的本机 iface IP，用于拼
+    /// play_url 里的 http 地址；标准/直通模式不使用，恒为 None。
+    proxy_host: Arc<Mutex<Option<String>>>,
     /// 频道内各子任务句柄，stop_and_wait 会等待它们全部退出
     join_handles: Vec<JoinHandle<()>>,
 }
@@ -109,9 +112,48 @@ impl ChannelHandle {
             http_port,
             normalize_path(&http_path)
         );
-        let supervisor = FfmpegSupervisor::new(config.clone(), input_url, false, ffmpeg_bin);
-        let ffmpeg_status = Arc::clone(&supervisor.status);
-        let supervisor_handle = tokio::spawn(Arc::clone(&supervisor).run(stop_rx.clone()));
+
+        let proxy_host = Arc::new(Mutex::new(None));
+
+        let (ffmpeg_status, join_handles) = if config.proxy_only {
+            // 纯代理加速模式：不拉起 ffmpeg、不组播推流，poller+downloader+http_server
+            // 这条"下载加速→缓存→http 代理转发"的链路已经完整闭环，客户端直接拉
+            // 内部 http server 的 m3u8/ts 播放即可。
+            //
+            // 这里没有真实子进程可监督，running 语义退化为"频道任务是否仍在跑"，
+            // 而不是像标准模式那样反映某个具体进程的存活；spawn 成功即视为 running，
+            // 下载健康状况已经由 status() 里的 overloaded/active_server/cached_segments
+            // 单独反映，不依赖这个 running 字段。
+            let ffmpeg_status = Arc::new(FfmpegStatus::default());
+            ffmpeg_status.running.store(true, Ordering::Relaxed);
+
+            // 异步解析本机 iface IP，用于 play_url() 给客户端展示可直接访问的 http 地址
+            // （内部 http server 监听 0.0.0.0，但 127.0.0.1 只在本机有效，客户端需要
+            // 真实局域网 IP）。失败也不影响代理本身工作，只影响 play_url 展示。
+            //
+            // 这个任务的 handle 纳入 join_handles：虽然它是一次性的、通常几十毫秒内
+            // 就会退出，但纳入统一管理能保证 stop_and_wait() 的"等待所有子任务退出"
+            // 语义名副其实，避免频道刚启动就被立即停止时出现游离在外、不受管理的任务。
+            let iface_handle = {
+                let proxy_host = Arc::clone(&proxy_host);
+                let iface = config.iface.clone();
+                let channel_id = config.id.clone();
+                tokio::spawn(async move {
+                    if let Some(ip) = iface::resolve_iface_ip(&iface).await {
+                        *proxy_host.lock().unwrap() = Some(ip);
+                    } else {
+                        tracing::warn!(channel = %channel_id, iface, "failed to resolve iface ip for proxy_only play_url");
+                    }
+                })
+            };
+
+            (ffmpeg_status, vec![poller_handle, http_handle, iface_handle])
+        } else {
+            let supervisor = FfmpegSupervisor::new(config.clone(), input_url, false, ffmpeg_bin);
+            let ffmpeg_status = Arc::clone(&supervisor.status);
+            let supervisor_handle = tokio::spawn(Arc::clone(&supervisor).run(stop_rx.clone()));
+            (ffmpeg_status, vec![poller_handle, http_handle, supervisor_handle])
+        };
 
         ChannelHandle {
             config,
@@ -120,7 +162,8 @@ impl ChannelHandle {
             cache: Some(cache),
             mirror_pool: Some(mirror_pool),
             downloader: Some(downloader),
-            join_handles: vec![poller_handle, http_handle, supervisor_handle],
+            proxy_host,
+            join_handles,
         }
     }
 
@@ -138,6 +181,7 @@ impl ChannelHandle {
             cache: None,
             mirror_pool: None,
             downloader: None,
+            proxy_host: Arc::new(Mutex::new(None)),
             join_handles: vec![supervisor_handle],
         }
     }
@@ -154,6 +198,23 @@ impl ChannelHandle {
     }
 
     pub fn play_url(&self) -> String {
+        if self.config.proxy_only {
+            // 纯代理加速模式：没有组播地址，客户端应直接拉取内部 http server
+            // 代理转发出的 m3u8。host 优先用异步解析出的本机 iface IP；
+            // 尚未解析出来（刚启动/解析失败）时退回 "<iface名>" 占位，
+            // 提示用户这是需要手动替换的展示位，而不是给一个会误导人的假地址。
+            let host = self
+                .proxy_host
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| format!("<{}>", self.config.iface));
+            let http_port = self.config.http_port.unwrap_or(0);
+            return format!(
+                "http://{host}:{http_port}{}/playlist.m3u8",
+                normalize_path(&self.config.http_path)
+            );
+        }
         let scheme = match self.config.protocol {
             m3u8mc_common::config::Protocol::Rtp => "rtp",
             m3u8mc_common::config::Protocol::Udp => "udp",
@@ -162,12 +223,29 @@ impl ChannelHandle {
     }
 
     pub fn status(&self) -> ChannelStatus {
-        let mode = if self.config.use_downloader { "standard" } else { "passthrough" };
+        let mode = if !self.config.use_downloader {
+            "passthrough"
+        } else if self.config.proxy_only {
+            "proxy"
+        } else {
+            "standard"
+        };
         let cached_segments = self.cache.as_ref().map(|c| c.len()).unwrap_or(0);
         let active_server = self.mirror_pool.as_ref().and_then(|p| p.peek_next_server());
         let overloaded = self.downloader.as_ref().map(|d| d.is_overloaded()).unwrap_or(false);
         let running = self.ffmpeg_status.running.load(Ordering::Relaxed);
         let pid = self.ffmpeg_status.pid.load(Ordering::Relaxed);
+
+        // proxy_only 模式下，iface IP 是异步解析的，频道刚启动的极短窗口内可能还没
+        // 解析完成，此时 play_url() 会返回 "<iface名>" 占位符而非真实可用地址。
+        // 这里通过 last_error 显式提示调用方（CLI/上层）这一过渡态，避免占位符被
+        // 当成正常地址直接展示给终端用户。一旦解析完成（或者不是 proxy_only 模式），
+        // 这个提示自然消失，不需要额外状态机。
+        let last_error = if self.config.proxy_only && self.proxy_host.lock().unwrap().is_none() {
+            Some("proxy_only: iface IP not resolved yet, play_url is a placeholder".to_string())
+        } else {
+            None
+        };
 
         ChannelStatus {
             id: self.config.id.clone(),
@@ -180,7 +258,7 @@ impl ChannelHandle {
             ffmpeg_pid: if pid == 0 { None } else { Some(pid) },
             ffmpeg_restarts: self.ffmpeg_status.restarts.load(Ordering::Relaxed),
             overloaded,
-            last_error: None,
+            last_error,
             play_url: self.play_url(),
         }
     }
