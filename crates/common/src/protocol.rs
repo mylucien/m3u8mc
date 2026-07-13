@@ -23,7 +23,7 @@ pub struct ChannelStatus {
     pub name: String,
     pub enabled: bool,
     pub running: bool,
-    pub mode: String, // "standard" | "passthrough"
+    pub mode: String, // "standard" | "passthrough" | "proxy"
     pub cached_segments: usize,
     pub active_server: Option<String>,
     pub ffmpeg_pid: Option<u32>,
