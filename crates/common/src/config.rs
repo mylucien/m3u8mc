@@ -61,6 +61,13 @@ pub struct ChannelConfig {
     pub http_port: Option<u16>,
     pub http_path: String,
     pub use_downloader: bool,
+    /// 纯代理加速模式（不拉起 ffmpeg、不组播推流）：只对外提供内部 HTTP server
+    /// 代理转发出的 m3u8 播放列表 + 分片（多线程/分块/多源加速下载后的缓存），
+    /// 客户端直接用播放器拉取该 http 地址播放，不经过 ffmpeg 重新封装。
+    /// 只在 use_downloader=1（标准模式）下有意义，proxy_only=1 但 use_downloader=0
+    /// 是无效组合（直通模式本身就没有下载/缓存管线，也没有可代理的内容）。
+    /// UCI: option proxy_only '1'
+    pub proxy_only: bool,
     pub race_mode: bool,
     /// 赛马模式候选地址。每条支持两种写法：
     /// - `1.2.3.4`：纯 IP/地址，不带专属域名，实际 Host 走 race_host 配置或自动推断兜底；
@@ -227,6 +234,8 @@ pub enum ConfigError {
     MissingField(String, String),
     #[error("channel '{0}': use_downloader=0 (直通模式) 但配置了多个 url，直通模式只允许单一源")]
     PassthroughMultipleUrls(String),
+    #[error("channel '{0}': proxy_only=1 (纯代理加速模式) 要求 use_downloader=1，直通模式没有下载/缓存管线，无法提供代理服务")]
+    ProxyOnlyRequiresDownloader(String),
     #[error("channel '{0}': invalid protocol")]
     InvalidProtocol(String),
 }
@@ -276,13 +285,21 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
 
         let urls: Vec<String> = sec.list("url").to_vec();
         let use_downloader = sec.get_bool("use_downloader", true);
+        let proxy_only = sec.get_bool("proxy_only", false);
 
         if !use_downloader && urls.len() > 1 {
             return Err(ConfigError::PassthroughMultipleUrls(id));
         }
+        if proxy_only && !use_downloader {
+            return Err(ConfigError::ProxyOnlyRequiresDownloader(id));
+        }
 
+        // proxy_only 模式不组播推流，protocol 字段完全用不上；此时即便用户手滑填了
+        // 非法值，也不应该因为一个无关字段导致整个频道解析失败——直接忽略、退回默认值。
+        // 非 proxy_only 场景（真正需要组播）仍然严格校验，行为不变。
         let protocol = match sec.get_or("protocol", "rtp").parse::<Protocol>() {
             Ok(p) => p,
+            Err(_) if proxy_only => Protocol::Rtp,
             Err(_) => return Err(ConfigError::InvalidProtocol(id)),
         };
 
@@ -312,14 +329,22 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
             name: sec.get_or("name", &id),
             urls,
             protocol,
-            addr: sec
-                .get("addr")
-                .ok_or_else(|| ConfigError::MissingField(id.clone(), "addr".into()))?
-                .to_string(),
-            port: sec
-                .get("port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .ok_or_else(|| ConfigError::MissingField(id.clone(), "port".into()))?,
+            addr: if proxy_only {
+                // 纯代理加速模式不组播推流，不需要组播地址；未填时留空，
+                // play_url() 会返回内部 http 代理地址而不是 udp/rtp 地址。
+                sec.get("addr").unwrap_or_default().to_string()
+            } else {
+                sec.get("addr")
+                    .ok_or_else(|| ConfigError::MissingField(id.clone(), "addr".into()))?
+                    .to_string()
+            },
+            port: if proxy_only {
+                sec.get("port").and_then(|p| p.parse::<u16>().ok()).unwrap_or(0)
+            } else {
+                sec.get("port")
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .ok_or_else(|| ConfigError::MissingField(id.clone(), "port".into()))?
+            },
             iface: sec.get_or("iface", "lan"),
             ttl: sec.get_parsed("ttl", 4u8),
             pkt_size: sec.get_parsed("pkt_size", 1316u32),
@@ -331,6 +356,7 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
             http_port,
             http_path: sec.get("http_path").filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| "/live".to_string()),
             use_downloader,
+            proxy_only,
             race_mode: sec.get_bool("race_mode", false),
             race_ips: sec.list("race_ip").iter().filter(|s| !s.is_empty()).cloned().collect(),
             race_host: sec.get_or("race_host", ""),
@@ -457,6 +483,98 @@ mod normalization_tests {
         ]);
     }
 
+    #[test]
+    fn proxy_only_conflicts_with_passthrough() {
+        let input = r#"
+config channel 'ch1'
+    option enabled '1'
+    option use_downloader '0'
+    option proxy_only '1'
+    list url 'http://a/playlist.m3u8'
+"#;
+        let err = parse_str(input).unwrap_err();
+        assert!(matches!(err, ConfigError::ProxyOnlyRequiresDownloader(id) if id == "ch1"));
+    }
+
+    #[test]
+    fn proxy_only_does_not_require_addr_or_port() {
+        // 纯代理加速模式下不需要 addr/port（没有组播目标），不应报 MissingField。
+        let input = r#"
+config channel 'ch1'
+    option enabled '1'
+    option use_downloader '1'
+    option proxy_only '1'
+    list url 'http://a/playlist.m3u8'
+"#;
+        let cfg = parse_str(input).unwrap();
+        let ch = &cfg.channels[0];
+        assert!(ch.proxy_only);
+        assert_eq!(ch.addr, "");
+        assert_eq!(ch.port, 0);
+        assert!(ch.http_port.is_some());
+    }
+
+    #[test]
+    fn standard_mode_still_requires_addr_and_port() {
+        // 非 proxy_only 的标准模式（需要组播推流）依然要求 addr/port 必填，
+        // 确认这条限制没有被这次改动放宽。
+        let input = r#"
+config channel 'ch1'
+    option enabled '1'
+    option use_downloader '1'
+    list url 'http://a/playlist.m3u8'
+"#;
+        let err = parse_str(input).unwrap_err();
+        assert!(matches!(err, ConfigError::MissingField(id, field) if id == "ch1" && field == "addr"));
+    }
+
+    #[test]
+    fn proxy_only_defaults_to_false() {
+        let input = r#"
+config channel 'ch1'
+    option enabled '1'
+    option use_downloader '1'
+    option addr '239.0.0.1'
+    option port '1234'
+    list url 'http://a/playlist.m3u8'
+"#;
+        let cfg = parse_str(input).unwrap();
+        assert!(!cfg.channels[0].proxy_only);
+    }
+
+    #[test]
+    fn proxy_only_tolerates_invalid_protocol() {
+        // proxy_only 模式下 protocol 字段用不上，非法值不应导致解析失败，
+        // 而是静默回退到默认的 Rtp（该值本身在这个模式下也不会被使用）。
+        let input = r#"
+config channel 'ch1'
+    option enabled '1'
+    option use_downloader '1'
+    option proxy_only '1'
+    option protocol 'not-a-real-protocol'
+    list url 'http://a/playlist.m3u8'
+"#;
+        let cfg = parse_str(input).unwrap();
+        assert_eq!(cfg.channels[0].protocol, Protocol::Rtp);
+    }
+
+    #[test]
+    fn non_proxy_only_still_rejects_invalid_protocol() {
+        // 非 proxy_only 场景（真正需要组播）依然严格校验 protocol，
+        // 确认这条限制没有被上面那条放宽规则误伤。
+        let input = r#"
+config channel 'ch1'
+    option enabled '1'
+    option use_downloader '1'
+    option addr '239.0.0.1'
+    option port '1234'
+    option protocol 'not-a-real-protocol'
+    list url 'http://a/playlist.m3u8'
+"#;
+        let err = parse_str(input).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidProtocol(id) if id == "ch1"));
+    }
+
     fn default_test_channel() -> ChannelConfig {
         ChannelConfig {
             id: "test".to_string(),
@@ -477,6 +595,7 @@ mod normalization_tests {
             http_port: None,
             http_path: "/live".to_string(),
             use_downloader: true,
+            proxy_only: false,
             race_mode: false,
             race_ips: vec![],
             race_host: String::new(),
