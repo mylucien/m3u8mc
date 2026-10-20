@@ -1,5 +1,6 @@
 mod channel;
 mod control;
+mod logfmt;
 mod manager;
 
 use clap::Parser;
@@ -26,6 +27,10 @@ struct Args {
     /// UCI 配置文件路径，对应 /etc/config/m3u8mc
     #[arg(long, default_value = "/etc/config/m3u8mc")]
     config: PathBuf,
+
+    /// 日志行首加时间戳。默认不加：procd/logread 与 docker logs 本身已带时间。
+    #[arg(long)]
+    log_timestamp: bool,
 }
 
 #[tokio::main]
@@ -37,7 +42,9 @@ async fn main() -> anyhow::Result<()> {
     let parsed = config::parse_str(&config_text)?;
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&parsed.global.log_level))
+        .with_env_filter(EnvFilter::new(logfmt::normalize_log_filter(&parsed.global.log_level)))
+        .with_ansi(false)
+        .event_format(logfmt::LineFormat { with_time: args.log_timestamp })
         .init();
 
     if !parsed.global.enabled {

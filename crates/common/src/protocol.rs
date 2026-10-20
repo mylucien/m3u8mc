@@ -25,6 +25,13 @@ pub struct ChannelStatus {
     pub running: bool,
     pub mode: String, // "standard" | "passthrough" | "proxy"
     pub cached_segments: usize,
+    /// 实际生效的缓存存储："memory" | "disk"（直通模式无缓存时为空串）。
+    /// 磁盘目录不可用而回退内存时这里会显示 "memory"。
+    #[serde(default)]
+    pub cache_storage: String,
+    /// 缓存当前占用字节数（内存或磁盘，取决于 cache_storage）。
+    #[serde(default)]
+    pub cache_bytes: u64,
     pub active_server: Option<String>,
     pub ffmpeg_pid: Option<u32>,
     pub ffmpeg_restarts: u64,

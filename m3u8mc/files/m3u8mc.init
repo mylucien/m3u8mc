@@ -22,8 +22,14 @@ start_service() {
     procd_set_param respawn 3600 5 5   # 1h 窗口内最多 5 次重启，之后不再自动重启
     procd_set_param stderr 1
     procd_set_param stdout 1
-    procd_set_param file "$CONFIG"     # 文件变化时 procd 自动重启服务
     procd_close_instance
+}
+
+# 配置变更（LuCI 保存并应用 / uci commit m3u8mc）时调用 reload_service 做热重载，
+# 只影响变更的频道。之前用 procd_set_param file 监视配置文件，
+# 任何改动都会整体重启 daemon，所有频道断流一遍，热重载形同虚设。
+service_triggers() {
+    procd_add_reload_trigger m3u8mc
 }
 
 stop_service() {

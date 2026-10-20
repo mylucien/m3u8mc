@@ -15,12 +15,12 @@ define Package/m3u8mc
   CATEGORY:=Network
   SUBMENU:=Streaming
   TITLE:=m3u8 转组播转发服务
-  DEPENDS:=+ffmpeg +curl +file +tar +liblzma +kmod-v4l2loopback
+  DEPENDS:=+ffmpeg
 endef
 
 define Package/m3u8mc/description
   将 HTTP 单播 m3u8 直播源（支持多镜像服务器）拉流、缓存，转换为 UDP/RTP 组播推送。
-  Rust 实现的核心转发引擎 m3u8mcd + procd 服务管理 + 可选网络隔离（VLAN/防火墙）。
+  Rust 实现的核心转发引擎 m3u8mcd + procd 服务管理。
 endef
 
 define Build/Compile
@@ -41,12 +41,6 @@ define Package/m3u8mc/install
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/m3u8mc.config $(1)/etc/config/m3u8mc
-
-	$(INSTALL_DIR) $(1)/usr/share/m3u8mc
-	$(INSTALL_BIN) ./files/network-isolation.sh \
-	    $(1)/usr/share/m3u8mc/network-isolation.sh
-	$(INSTALL_BIN) ./files/ffmpeg-install.sh \
-	    $(1)/usr/share/m3u8mc/ffmpeg-install.sh
 endef
 
 $(eval $(call BuildPackage,m3u8mc))

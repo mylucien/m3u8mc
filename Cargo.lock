@@ -681,6 +681,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -690,8 +692,12 @@ dependencies = [
  "anyhow",
  "clap",
  "m3u8mc-common",
+ "serde",
  "serde_json",
+ "thiserror",
  "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

@@ -19,6 +19,7 @@ use dashmap::DashSet;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use tracing::Instrument;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -216,14 +217,16 @@ impl Downloader {
                 };
                 match result {
                     Ok(data) => {
-                        this.cache.insert(seq, data, task.duration_secs);
+                        if let Err(e) = this.cache.insert(seq, data, task.duration_secs).await {
+                            tracing::warn!(rel_path = %task.rel_path, error = %e, "failed to store segment in cache (disk full or cache_dir unavailable?)");
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(rel_path = %task.rel_path, error = %e, "segment download failed on all candidates");
                     }
                 }
                 this.in_progress.remove(&task.key);
-            });
+            }.instrument(tracing::Span::current()));
         }
     }
 
@@ -460,8 +463,15 @@ impl Downloader {
     /// 赛马候选统一是"纯连接目标"，不带 path（mirror_pool 里的 url 候选先用
     /// strip_path 剥离掉可能带的路径），与相对/绝对路径无关，和 mirror_pool 里
     /// 候选来源也无关——这是问题1修复时就统一好的设计，这里延续。
-    fn build_race_candidates(&self, rel_path: &str) -> Vec<(String, Option<String>)> {
+    ///
+    /// 返回的第三个元素是该候选的“路径 base”：相对路径分片要按它（保留 url 里的目录部分）
+    /// 拼出完整路径，再把 scheme/host/port 换成候选的连接目标。
+    /// 之前相对路径分片直接拼在 strip_path 之后的纯连接目标上，url 里的目录
+    /// （如 `https://cdn/live/hi/`）被丢掉，请求变成 `http://<race_ip>/seg1.ts`，必然 404。
+    fn build_race_candidates(&self, rel_path: &str) -> Vec<(String, Option<String>, Option<String>)> {
         if !self.race_targets.is_empty() {
+            // race_ip 候选自己不带路径信息：相对路径分片用 url（mirror_pool）第一个 base 的路径
+            let path_base = self.mirror_pool.available_servers().into_iter().next();
             return self
                 .race_targets
                 .iter()
@@ -472,7 +482,7 @@ impl Downloader {
                         format!("{}://{ip}", self.default_race_scheme(rel_path))
                     };
                     let host = self.effective_race_host(per_target_host, rel_path);
-                    (base, host)
+                    (base, host, path_base.clone())
                 })
                 .collect();
         }
@@ -488,10 +498,10 @@ impl Downloader {
             };
             match &self.configured_race_host {
                 Some(rh) => match override_domain_keep_scheme_port(&host_only, rh) {
-                    Ok(overridden) => candidates.push((overridden, None)),
+                    Ok(overridden) => candidates.push((overridden, None, Some(s.clone()))),
                     Err(e) => tracing::warn!(server = %s, race_host = %rh, error = %e, "skip: race_host cannot override this url candidate's domain"),
                 },
-                None => candidates.push((host_only, None)),
+                None => candidates.push((host_only, None, Some(s.clone()))),
             }
         }
         candidates
@@ -505,8 +515,8 @@ impl Downloader {
         }
 
         let mut futs = FuturesUnordered::new();
-        for (server, host_override) in &candidates {
-            let url = match resolve_segment_url(server, &task.rel_path) {
+        for (server, host_override, path_base) in &candidates {
+            let url = match resolve_race_segment_url(server, path_base.as_deref(), &task.rel_path) {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!(server, rel_path = %task.rel_path, error = %e, "skip invalid race candidate for this segment");
@@ -646,6 +656,21 @@ fn resolve_segment_url(candidate_base: &str, rel_path: &str) -> anyhow::Result<S
     } else {
         Ok(Downloader::build_url(candidate_base, rel_path))
     }
+}
+
+/// 赛马模式下为某个候选算出本次请求的完整 URL。
+/// - 分片是绝对地址：只把 scheme/host/port 换成候选的连接目标（见 [`resolve_segment_url`]）；
+/// - 分片是相对路径：先按 `path_base`（url 配置，保留其目录部分）用标准 URL join 得到完整路径，
+///   再把 scheme/host/port 换成候选的连接目标。没有 path_base（没配 url）时无法确定路径，报错。
+fn resolve_race_segment_url(candidate_conn: &str, path_base: Option<&str>, rel_path: &str) -> anyhow::Result<String> {
+    if Downloader::is_absolute_url(rel_path) {
+        return resolve_segment_url(candidate_conn, rel_path);
+    }
+    let base = path_base.ok_or_else(|| {
+        anyhow::anyhow!("relative-path segment in race mode needs url as the path base (only list_url is configured)")
+    })?;
+    let full = Downloader::build_url(base, rel_path);
+    apply_host_override(&full, candidate_conn)
 }
 
 /// 只替换 base（"scheme://host[:port]"，不带 path，通常是 strip_path 的输出）的域名部分，
@@ -919,7 +944,7 @@ mod tests {
     /// 归一化函数解析，模拟真实调用方（config 层）的行为。
     fn make_downloader(url_bases: Vec<String>, race_ips: Vec<String>, race_host: &str) -> Arc<Downloader> {
         let mirror_pool = MirrorPool::new(url_bases);
-        let cache = SegmentCache::new(8, Duration::from_secs(30));
+        let cache = SegmentCache::new(8, Duration::from_secs(30), crate::channel::cache::CacheBackend::Memory);
         let race_targets: Vec<(String, Option<String>)> = race_ips
             .iter()
             .map(|entry| {
@@ -1081,5 +1106,50 @@ mod tests {
         // 只填了 list_url，url 和 race_ip 都没填：没有任何候选可竞速。
         let d = make_downloader(vec![], vec![], "");
         assert!(d.build_race_candidates("seg1.ts").is_empty());
+    }
+
+    #[test]
+    fn race_relative_segment_keeps_url_directory_for_race_ip() {
+        // 回归：url 带目录（playlist 在 /live/hi/ 下），分片是相对路径 seg1.ts，
+        // race_ip 候选必须请求 http://1.2.3.4/live/hi/seg1.ts，而不是 http://1.2.3.4/seg1.ts
+        let d = make_downloader(
+            vec!["http://cdn.example.com/live/hi/index.m3u8".to_string()],
+            vec!["1.2.3.4".to_string()],
+            "",
+        );
+        let c = &d.build_race_candidates("seg1.ts")[0];
+        let url = resolve_race_segment_url(&c.0, c.2.as_deref(), "seg1.ts").unwrap();
+        assert_eq!(url, "http://1.2.3.4/live/hi/seg1.ts");
+    }
+
+    #[test]
+    fn race_relative_segment_keeps_url_directory_in_url_fallback() {
+        let d = make_downloader(
+            vec!["https://cdn.example.com:8443/live/hi/index.m3u8".to_string()],
+            vec![],
+            "",
+        );
+        let c = &d.build_race_candidates("seg1.ts")[0];
+        let url = resolve_race_segment_url(&c.0, c.2.as_deref(), "seg1.ts").unwrap();
+        assert_eq!(url, "https://cdn.example.com:8443/live/hi/seg1.ts");
+    }
+
+    #[test]
+    fn race_relative_segment_without_url_base_errors() {
+        let d = make_downloader(vec![], vec!["1.2.3.4".to_string()], "");
+        let c = &d.build_race_candidates("seg1.ts")[0];
+        assert!(resolve_race_segment_url(&c.0, c.2.as_deref(), "seg1.ts").is_err());
+    }
+
+    #[test]
+    fn race_absolute_segment_unchanged_by_path_base() {
+        let d = make_downloader(
+            vec!["https://relay.example.com/x/".to_string()],
+            vec!["1.2.3.4".to_string()],
+            "",
+        );
+        let c = &d.build_race_candidates("https://cdn6.cc.cd/api/amty/1")[0];
+        let url = resolve_race_segment_url(&c.0, c.2.as_deref(), "https://cdn6.cc.cd/api/amty/1").unwrap();
+        assert_eq!(url, "https://1.2.3.4/api/amty/1");
     }
 }

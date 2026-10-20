@@ -7,7 +7,7 @@ pub mod m3u8;
 pub mod mirror_pool;
 pub mod poller;
 
-use cache::SegmentCache;
+use cache::{CacheBackend, SegmentCache};
 use downloader::{DownloadStrategy, Downloader};
 use ffmpeg_supervisor::{FfmpegStatus, FfmpegSupervisor};
 use m3u8mc_common::config::ChannelConfig;
@@ -15,6 +15,7 @@ use m3u8mc_common::protocol::ChannelStatus;
 use mirror_pool::MirrorPool;
 use poller::Poller;
 use std::sync::atomic::Ordering;
+use tracing::Instrument;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -49,12 +50,20 @@ impl ChannelHandle {
     }
 
     fn spawn_standard(config: ChannelConfig, ffmpeg_bin: String) -> Self {
+        // 本频道所有任务（含它们派生出的下载任务）共用的日志 span，
+        // logfmt 据此在每条日志前打上 [频道ID]。
+        // 必须用 error_span：span 自身的级别低于过滤级别时会被整个丢弃，
+        // 用 info_span 的话 log_level=warn 时日志里就没有频道标识了。
+        let span = tracing::error_span!("ch", id = %config.id);
+        let _enter = span.enter();
         let (stop_tx, stop_rx) = watch::channel(false);
 
-        // 问题2 修复：mirror_pool（下载 base 池）直接、且唯一地来自 config.urls，
-        // 不再由 Poller 解析 media playlist 目录后动态派生/替换。
-        // list_url 与 url 职责彻底分离：list_url 只喂给 Poller 拉列表，
-        // url（=mirror_pool 的初始内容）才是分片下载真正使用的 base。
+        // mirror_pool（下载 base 池）初始内容来自 config.urls。
+        // 配置了独立 list_url 时，list_url 与 url 职责彻底分离：list_url 只喂给 Poller 拉列表，
+        // url 才是分片下载真正使用的 base，Poller 不会改动 mirror_pool；
+        // 没配 list_url（url 兼任列表源）时，Poller 解析出各镜像 media playlist 的真实地址后
+        // 会刷新 mirror_pool（见 Poller::derive_bases），保证 master→variant 子目录场景下
+        // 相对路径分片按 RFC 8216 相对 media playlist 解析。
         // 只填 list_url、不填 url 时，这里就是空列表——相对路径分片会在
         // Downloader::download_round_robin 里报错（无下载 base），绝对路径分片
         // 则会直接使用分片自带的绝对地址下载，不需要 base。
@@ -63,7 +72,8 @@ impl ChannelHandle {
         // Poller 拿到真实 target_duration 后该估计可能略有偏差，但足以满足设计文档
         // 2.2 节 "cache_window 决定的时间窗口应大于等于 hls_segments 覆盖时长" 的约束。
         let window = Duration::from_secs_f32(6.0 * config.cache_window as f32);
-        let cache = SegmentCache::new(config.max_segments, window);
+        let backend = CacheBackend::from_config(config.cache_storage, &config.cache_dir);
+        let cache = SegmentCache::new(config.max_segments, window, backend);
 
         let strategy = if config.race_mode {
             DownloadStrategy::Race
@@ -89,8 +99,10 @@ impl ChannelHandle {
             config.effective_poller_headers(),
             config.list_poll_interval_secs,
             &config.list_proxy,
+            // 未单独配置 list_url（url 兼任列表源）时，下载 base 跟随解析出的 media playlist 地址
+            if config.list_urls.is_empty() { Some(Arc::clone(&mirror_pool)) } else { None },
         );
-        let poller_handle = tokio::spawn(poller.run(stop_rx.clone()));
+        let poller_handle = tokio::spawn(poller.run(stop_rx.clone()).instrument(span.clone()));
 
         let http_port = config.http_port.expect("standard mode requires http_port to be set");
         let http_path = config.http_path.clone();
@@ -99,12 +111,12 @@ impl ChannelHandle {
             let http_path_clone = http_path.clone();
             let hls_segments = config.hls_segments;
             let stop_rx = stop_rx.clone();
-            let channel_id = config.id.clone();
+            let span = span.clone();
             tokio::spawn(async move {
                 if let Err(e) = http_server::serve(cache, http_path_clone, hls_segments, http_port, stop_rx).await {
-                    tracing::error!(channel = %channel_id, error = %e, "internal http server exited with error");
+                    tracing::error!(error = %e, "internal http server exited with error");
                 }
-            })
+            }.instrument(span))
         };
 
         let input_url = format!(
@@ -137,21 +149,21 @@ impl ChannelHandle {
             let iface_handle = {
                 let proxy_host = Arc::clone(&proxy_host);
                 let iface = config.iface.clone();
-                let channel_id = config.id.clone();
+                let span = span.clone();
                 tokio::spawn(async move {
                     if let Some(ip) = iface::resolve_iface_ip(&iface).await {
                         *proxy_host.lock().unwrap() = Some(ip);
                     } else {
-                        tracing::warn!(channel = %channel_id, iface, "failed to resolve iface ip for proxy_only play_url");
+                        tracing::warn!(iface, "failed to resolve iface ip for proxy_only play_url");
                     }
-                })
+                }.instrument(span))
             };
 
             (ffmpeg_status, vec![poller_handle, http_handle, iface_handle])
         } else {
             let supervisor = FfmpegSupervisor::new(config.clone(), input_url, false, ffmpeg_bin);
             let ffmpeg_status = Arc::clone(&supervisor.status);
-            let supervisor_handle = tokio::spawn(Arc::clone(&supervisor).run(stop_rx.clone()));
+            let supervisor_handle = tokio::spawn(Arc::clone(&supervisor).run(stop_rx.clone()).instrument(span.clone()));
             (ffmpeg_status, vec![poller_handle, http_handle, supervisor_handle])
         };
 
@@ -168,11 +180,13 @@ impl ChannelHandle {
     }
 
     fn spawn_passthrough(config: ChannelConfig, ffmpeg_bin: String) -> Self {
+        let span = tracing::error_span!("ch", id = %config.id);
+        let _enter = span.enter();
         let (stop_tx, stop_rx) = watch::channel(false);
         let input_url = config.urls.first().cloned().unwrap_or_default();
         let supervisor = FfmpegSupervisor::new(config.clone(), input_url, true, ffmpeg_bin);
         let ffmpeg_status = Arc::clone(&supervisor.status);
-        let supervisor_handle = tokio::spawn(Arc::clone(&supervisor).run(stop_rx.clone()));
+        let supervisor_handle = tokio::spawn(Arc::clone(&supervisor).run(stop_rx.clone()).instrument(span.clone()));
 
         ChannelHandle {
             config,
@@ -188,12 +202,14 @@ impl ChannelHandle {
 
     pub async fn stop_and_wait(&mut self) {
         let _ = self.stop_tx.send(true);
-        if self.join_handles.is_empty() {
-            return;
-        }
         // 给每个子任务最多 SHUTDOWN_TIMEOUT 时长完成退出
         for handle in &mut self.join_handles {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, handle).await;
+        }
+        // 子任务都停了之后再清缓存：磁盘模式下删除分片文件，并让仍在途的下载任务
+        // 之后的写入被丢弃，不在磁盘上留孤儿文件。
+        if let Some(cache) = &self.cache {
+            cache.shutdown().await;
         }
     }
 
@@ -231,6 +247,12 @@ impl ChannelHandle {
             "standard"
         };
         let cached_segments = self.cache.as_ref().map(|c| c.len()).unwrap_or(0);
+        let cache_bytes = self.cache.as_ref().map(|c| c.total_bytes()).unwrap_or(0);
+        let cache_storage = self
+            .cache
+            .as_ref()
+            .map(|c| c.storage_name().to_string())
+            .unwrap_or_default();
         let active_server = self.mirror_pool.as_ref().and_then(|p| p.peek_next_server());
         let overloaded = self.downloader.as_ref().map(|d| d.is_overloaded()).unwrap_or(false);
         let running = self.ffmpeg_status.running.load(Ordering::Relaxed);
@@ -254,6 +276,8 @@ impl ChannelHandle {
             running,
             mode: mode.to_string(),
             cached_segments,
+            cache_storage,
+            cache_bytes,
             active_server,
             ffmpeg_pid: if pid == 0 { None } else { Some(pid) },
             ffmpeg_restarts: self.ffmpeg_status.restarts.load(Ordering::Relaxed),

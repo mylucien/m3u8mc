@@ -8,7 +8,7 @@
 use super::cache::SegmentCache;
 use super::downloader::{apply_proxy, parse_headers, Downloader, SegmentTask};
 use super::m3u8::{self, ParsedPlaylist};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use super::mirror_pool::MirrorPool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -34,8 +34,15 @@ pub struct Poller {
     /// 解析出的各镜像 media playlist 完整地址，按 origin_urls 顺序对应
     media_urls: Mutex<Vec<String>>,
     last_target_duration: Mutex<f32>,
-    last_max_global_seq: AtomicU64,
-    has_baseline: AtomicBool,
+    /// 序号追踪状态（见 [`SeqTracker`]）
+    seq: Mutex<SeqTracker>,
+    /// 仅当 url 同时兼任列表源（未单独配置 list_url）时为 Some：
+    /// 每次解析出各镜像 media playlist 的真实地址后，用它们刷新下载 base。
+    /// 相对路径分片按 RFC 8216 本来就是相对于 media playlist 的地址解析的；
+    /// 如果这里仍用配置里的 master 地址当 base，master → variant 子目录的场景
+    /// （variant 在 `hi/index.m3u8`，分片是 `seg1.ts`）会拼成 `<master目录>/seg1.ts`，404。
+    /// 单独配置了 list_url 时保持“列表/下载完全解耦”的语义，不动 mirror_pool。
+    derive_bases: Option<Arc<MirrorPool>>,
     /// 用户显式配置的轮询间隔（秒）。> 0 时固定使用该值；
     /// <= 0（未配置）时沿用旧的自适应逻辑：target_duration/2。
     poll_interval_override: Option<Duration>,
@@ -51,6 +58,7 @@ impl Poller {
         http_headers: &[String],
         poll_interval_secs: f32,
         proxy: &str,
+        derive_bases: Option<Arc<MirrorPool>>,
     ) -> Arc<Self> {
         let default_headers = parse_headers(http_headers);
         let mut builder = reqwest::Client::builder()
@@ -70,8 +78,8 @@ impl Poller {
             origin_urls,
             media_urls: Mutex::new(Vec::new()),
             last_target_duration: Mutex::new(6.0),
-            last_max_global_seq: AtomicU64::new(0),
-            has_baseline: AtomicBool::new(false),
+            seq: Mutex::new(SeqTracker::default()),
+            derive_bases,
             poll_interval_override,
         })
     }
@@ -84,23 +92,35 @@ impl Poller {
         Ok(resp.text().await?)
     }
 
-    /// 二级播放列表解析：只负责解析出每个镜像 media playlist 的完整地址并记入
+    /// 二级播放列表解析：解析出每个镜像 media playlist 的完整地址并记入
     /// self.media_urls，供后续轮询 fetch_media_playlist 使用。
     ///
-    /// 问题2 修复：不再计算/返回下载 base（原来的 "media playlist 所在目录"），
-    /// 也不再据此驱动 MirrorPool（下载 base 完全由 ChannelConfig.urls 独立提供，
-    /// 一次性在 channel 启动时传给 MirrorPool，不随这里的解析结果变化）。
-    /// 同理，也不再自动把 race_host 推断为 media playlist 所在域名——
-    /// 赛马模式下的 Host 覆盖现在完全由用户显式配置的 race_host / race_ip@host 决定，
-    /// 不做任何隐式推断（详见 Downloader::effective_race_host）。
+    /// 下载 base：配置了独立 list_url 时，下载 base 完全由 `url` 决定（与这里解析结果无关）；
+    /// 没配 list_url（url 兼任列表源）时，下载 base 跟随这里解析出的 media playlist 地址
+    /// （见 `derive_bases`）。赛马模式下的 Host 覆盖始终只由用户显式配置的
+    /// race_host / race_ip@host 决定，不做隐式推断。
     async fn resolve_master(&self) -> anyhow::Result<()> {
-        let first_url = self
-            .origin_urls
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("channel has no configured list url"))?;
+        if self.origin_urls.is_empty() {
+            anyhow::bail!("channel has no configured list url");
+        }
 
-        let text = self.fetch_text(first_url).await?;
-        let parsed = m3u8::parse(&text);
+        // 依次尝试各个镜像，第一个能拉到的就用来判断 master/media；
+        // 之前只试第一个镜像，第一个镜像挂了会导致整个频道起不来（其余镜像白配）。
+        let mut parsed = None;
+        let mut last_err: Option<anyhow::Error> = None;
+        for origin in &self.origin_urls {
+            match self.fetch_text(origin).await {
+                Ok(text) => {
+                    parsed = Some(m3u8::parse(&text));
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(url = %origin, error = %e, "list url unavailable while resolving master playlist, trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        let parsed = parsed.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("no list url reachable")))?;
 
         let variant_path: Option<String> = match parsed {
             ParsedPlaylist::Master(variants) => {
@@ -111,18 +131,11 @@ impl Poller {
             ParsedPlaylist::Media(_) => None, // 单级列表，master 本身即 media playlist
         };
 
-        let mut media_urls = Vec::with_capacity(self.origin_urls.len());
-        for origin in &self.origin_urls {
-            let media_url = match &variant_path {
-                Some(path) => {
-                    let base = Url::parse(origin)?;
-                    base.join(path)?.to_string()
-                }
-                None => origin.clone(),
-            };
-            media_urls.push(media_url);
-        }
+        let media_urls = build_media_urls(&self.origin_urls, variant_path.as_deref())?;
 
+        if let Some(pool) = &self.derive_bases {
+            pool.replace_servers(media_urls.clone());
+        }
         *self.media_urls.lock().unwrap() = media_urls;
         Ok(())
     }
@@ -221,44 +234,27 @@ impl Poller {
     fn process_playlist(&self, playlist: m3u8::MediaPlaylist) {
         let base_seq = playlist.media_sequence;
         let seg_count = playlist.segments.len() as u64;
-        let current_max = base_seq + seg_count;
 
-        let has_baseline = self.has_baseline.load(Ordering::Relaxed);
-        let last_max = self.last_max_global_seq.load(Ordering::Relaxed);
-
-        // 重置阈值改为动态 2×playlist_len（对齐旧版 Python 的
-        // `last_seq_in_playlist < seen_seq - len(segments)*2`），而不是固定的 50。
-        // 直播 playlist 通常只有 3~5 个分片，固定阈值 50 意味着"真实的上游重启/切源"
-        // （比如序号只回退了 10~20）根本触发不了硬重置：baseline 不会被清零，
-        // start_from 仍然停留在重启前的旧序号上，之后每一轮新 playlist 里的 global_seq
-        // 全都小于 start_from，被当成"已处理过的旧分片"过滤掉——相当于这个频道从此
-        // 再也没有新分片被提交下载，表现为频道卡死不动但没有任何报错。
-        let last_seq_in_playlist = base_seq + seg_count.saturating_sub(1);
-        let rollback_reset_threshold = seg_count.saturating_mul(2);
-
-        if has_baseline
-            && seg_count > 0
-            && last_seq_in_playlist < last_max.saturating_sub(rollback_reset_threshold)
-        {
-            tracing::warn!(
-                old_max = last_max,
-                new_base = base_seq,
-                playlist_len = seg_count,
-                reset_threshold = rollback_reset_threshold,
-                "media sequence rolled back sharply, assuming upstream server restarted; resetting baseline"
-            );
-            self.has_baseline.store(false, Ordering::Relaxed);
-        } else if has_baseline && base_seq < last_max {
-            tracing::warn!(
-                old_max = last_max,
-                new_base = base_seq,
-                rollback = last_max - base_seq,
-                "media sequence partially rolled back (below threshold), new segments may be skipped until sequence catches up"
-            );
+        let (start_from, event) = self.seq.lock().unwrap().advance(base_seq, seg_count);
+        match event {
+            Some(SeqEvent::HardReset { old_max }) => {
+                tracing::warn!(
+                    old_max,
+                    new_base = base_seq,
+                    playlist_len = seg_count,
+                    "media sequence rolled back sharply, assuming upstream server restarted; resetting baseline"
+                );
+            }
+            Some(SeqEvent::PartialRollback { old_max, new_max }) => {
+                tracing::warn!(
+                    old_max,
+                    new_max,
+                    new_base = base_seq,
+                    "media sequence partially rolled back (below threshold), new segments may be skipped until sequence catches up"
+                );
+            }
+            None => {}
         }
-
-        let has_baseline = self.has_baseline.load(Ordering::Relaxed);
-        let start_from = if has_baseline { last_max } else { base_seq };
 
         let mut new_tasks = Vec::new();
         for (i, seg) in playlist.segments.iter().enumerate() {
@@ -276,19 +272,167 @@ impl Poller {
         if !new_tasks.is_empty() {
             self.downloader.submit(new_tasks);
         }
-
-        // 关键修复：last_max_global_seq 语义上是"迄今为止见过的最大 seq"，必须单调不减。
-        // 之前这里是无条件 store：一旦某次上游播放列表的 base_seq+len(segments) 比历史值小
-        // （多镜像/多 CDN 节点数据不完全同步导致的窗口抖动很容易触发），游标会被直接拽回去，
-        // 造成已下载过的分片被重新判定为"新分片"再次提交下载，还会污染下面轮的
-        // SEQUENCE_ROLLBACK_THRESHOLD 硬重置判断基准。改用 fetch_max 保证只增不减，
-        // 与旧版 Python 实现里 `if new_segs: self._seen_seq = new_segs[-1]["seq"]`
-        // （只在真正推进时更新，且取当轮最大值）的语义保持一致。
-        self.last_max_global_seq.fetch_max(current_max, Ordering::Relaxed);
-        self.has_baseline.store(true, Ordering::Relaxed);
     }
 }
 
+/// 由各镜像的列表地址 + （可选的）master 里选出的 variant 路径，得到各镜像 media playlist 的完整地址。
+/// 单级列表（无 variant）时原样返回；variant 是绝对地址时 join 会原样返回它（各镜像相同）。
+fn build_media_urls(origins: &[String], variant_path: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::with_capacity(origins.len());
+    for origin in origins {
+        let media_url = match variant_path {
+            Some(path) => Url::parse(origin)?.join(path)?.to_string(),
+            None => origin.clone(),
+        };
+        out.push(media_url);
+    }
+    Ok(out)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SeqEvent {
+    /// 上游序号大幅回退（判定为上游重启/切源），基线已重置
+    HardReset { old_max: u64 },
+    /// 序号小幅回退（多镜像/多 CDN 节点窗口不同步等），不重置，仅提示
+    PartialRollback { old_max: u64, new_max: u64 },
+}
+
+/// 记录“迄今为止见过的最大全局序号”，决定每轮 playlist 里哪些分片是新的。
+#[derive(Debug, Default)]
+struct SeqTracker {
+    last_max: u64,
+    has_baseline: bool,
+}
+
+impl SeqTracker {
+    /// 处理一轮 playlist（`base_seq` = EXT-X-MEDIA-SEQUENCE，`seg_count` = 分片数），
+    /// 返回本轮应当开始下载的全局序号下限 `start_from`（小于它的分片视为已处理）。
+    ///
+    /// - 硬重置阈值为动态 2×playlist_len（对齐旧版 Python 实现）：直播 playlist 通常只有
+    ///   3~5 个分片，固定阈值（如 50）意味着真实的上游重启（序号只回退 10~20）永远触发不了
+    ///   重置，之后所有新分片都被当成“已处理过”过滤掉，频道卡死但没有任何报错。
+    /// - 硬重置时必须把 `last_max` 一并清零。之前只清了 has_baseline、没清 last_max，
+    ///   而后面是 `fetch_max` 更新：旧的大值保留下来，下一轮 playlist 又满足“大幅回退”条件，
+    ///   于是每个轮询周期都重置一次、把 playlist 里全部分片重新下载一遍，直到上游序号追上旧值。
+    /// - 小幅回退的判定用 `current_max < last_max`（playlist 末尾落后于已见最大值）。
+    ///   之前用的是 `base_seq < last_max`，而正常滑动窗口的新 playlist 的 base 本来就
+    ///   小于上一轮的 last_max（窗口有重叠），导致每次轮询都误报一条警告。
+    fn advance(&mut self, base_seq: u64, seg_count: u64) -> (u64, Option<SeqEvent>) {
+        let current_max = base_seq + seg_count;
+        let last_seq_in_playlist = base_seq + seg_count.saturating_sub(1);
+        let reset_threshold = seg_count.saturating_mul(2);
+
+        let mut event = None;
+        if self.has_baseline
+            && seg_count > 0
+            && last_seq_in_playlist < self.last_max.saturating_sub(reset_threshold)
+        {
+            event = Some(SeqEvent::HardReset { old_max: self.last_max });
+            self.has_baseline = false;
+            self.last_max = 0;
+        } else if self.has_baseline && seg_count > 0 && current_max < self.last_max {
+            event = Some(SeqEvent::PartialRollback {
+                old_max: self.last_max,
+                new_max: current_max,
+            });
+        }
+
+        let start_from = if self.has_baseline { self.last_max } else { base_seq };
+
+        // last_max 只增不减：多镜像窗口抖动时不能把游标拽回去，否则已下载分片会被重复提交。
+        self.last_max = self.last_max.max(current_max);
+        self.has_baseline = true;
+        (start_from, event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_round_downloads_whole_playlist() {
+        let mut t = SeqTracker::default();
+        let (start, ev) = t.advance(100, 5);
+        assert_eq!(start, 100);
+        assert_eq!(ev, None);
+    }
+
+    #[test]
+    fn sliding_window_has_no_warning_and_only_new_segments() {
+        let mut t = SeqTracker::default();
+        t.advance(100, 5); // 100..=104
+        // 窗口前进 1：base=101，与上一轮重叠，这是常态，不应有任何 rollback 事件
+        let (start, ev) = t.advance(101, 5); // 101..=105
+        assert_eq!(start, 105, "只有 seq 105 是新的");
+        assert_eq!(ev, None, "正常滑动窗口不应误报 partial rollback");
+        // 同一份 playlist 重复拉取：没有新分片
+        let (start, ev) = t.advance(101, 5);
+        assert_eq!(start, 106);
+        assert_eq!(ev, None);
+    }
+
+    #[test]
+    fn small_rollback_warns_but_keeps_baseline() {
+        let mut t = SeqTracker::default();
+        t.advance(100, 5); // last_max=105
+        let (start, ev) = t.advance(99, 5); // 末尾 104 < 105，但没到 2×len 阈值
+        assert_eq!(start, 105);
+        assert_eq!(ev, Some(SeqEvent::PartialRollback { old_max: 105, new_max: 104 }));
+        // 游标没有被拽回
+        let (start, _) = t.advance(101, 5);
+        assert_eq!(start, 105);
+    }
+
+    #[test]
+    fn hard_reset_happens_once_then_tracks_new_sequence() {
+        let mut t = SeqTracker::default();
+        t.advance(1000, 5); // last_max=1005
+        // 上游重启：序号从 10 重新开始
+        let (start, ev) = t.advance(10, 5);
+        assert_eq!(ev, Some(SeqEvent::HardReset { old_max: 1005 }));
+        assert_eq!(start, 10, "重置后从新 playlist 的 base 开始下载");
+        // 关键回归点：下一轮不能再次触发重置（旧实现会，导致每轮重复下载全部分片）
+        let (start, ev) = t.advance(11, 5);
+        assert_eq!(ev, None);
+        assert_eq!(start, 15, "只下载新增的 seq 15");
+        let (start, ev) = t.advance(12, 5);
+        assert_eq!(ev, None);
+        assert_eq!(start, 16);
+    }
+
+    #[test]
+    fn empty_playlist_does_not_reset() {
+        let mut t = SeqTracker::default();
+        t.advance(100, 5);
+        let (_, ev) = t.advance(100, 0);
+        assert_eq!(ev, None);
+    }
+
+    #[test]
+    fn media_urls_join_variant_relative_to_each_origin() {
+        let origins = vec![
+            "http://a.example.com/live/index.m3u8".to_string(),
+            "http://b.example.com/x/master.m3u8?token=1".to_string(),
+        ];
+        let urls = build_media_urls(&origins, Some("hi/index.m3u8")).unwrap();
+        assert_eq!(urls[0], "http://a.example.com/live/hi/index.m3u8");
+        assert_eq!(urls[1], "http://b.example.com/x/hi/index.m3u8");
+    }
+
+    #[test]
+    fn media_urls_single_level_playlist_unchanged() {
+        let origins = vec!["http://a.example.com/live/index.m3u8?t=1".to_string()];
+        assert_eq!(build_media_urls(&origins, None).unwrap(), origins);
+    }
+
+    #[test]
+    fn media_urls_absolute_variant_is_kept() {
+        let origins = vec!["http://a.example.com/live/index.m3u8".to_string()];
+        let urls = build_media_urls(&origins, Some("https://cdn.example.com/v/hi.m3u8")).unwrap();
+        assert_eq!(urls[0], "https://cdn.example.com/v/hi.m3u8");
+    }
+}
 /// 等待 duration 或直到收到停止信号；返回 true 表示应当停止。
 async fn wait_or_stop(stop_rx: &mut watch::Receiver<bool>, duration: Duration) -> bool {
     tokio::select! {

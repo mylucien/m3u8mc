@@ -99,12 +99,11 @@ jobs:
           for f in \
             "m3u8mc/files/m3u8mc.init" \
             "m3u8mc/files/m3u8mc.config" \
-            "m3u8mc/files/ffmpeg-install.sh" \
-            "luci-app-m3u8mc/luci/controller/m3u8mc.lua" \
-            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channels.lua" \
-            "luci-app-m3u8mc/luci/model/cbi/m3u8mc/channel_edit.lua" \
-            "luci-app-m3u8mc/luci/view/m3u8mc/status.htm" \
-            "luci-app-m3u8mc/luci/view/m3u8mc/log.htm"; do
+            "luci-app-m3u8mc/htdocs/luci-static/resources/view/m3u8mc/channels.js" \
+            "luci-app-m3u8mc/htdocs/luci-static/resources/view/m3u8mc/status.js" \
+            "luci-app-m3u8mc/htdocs/luci-static/resources/view/m3u8mc/log.js" \
+            "luci-app-m3u8mc/root/usr/share/luci/menu.d/luci-app-m3u8mc.json" \
+            "luci-app-m3u8mc/root/usr/share/rpcd/acl.d/luci-app-m3u8mc.json"; do
             if [ -f "$f" ]; then echo "  OK $f"
             else echo "::error file=$f::missing"; missing=$((missing+1)); fi
           done

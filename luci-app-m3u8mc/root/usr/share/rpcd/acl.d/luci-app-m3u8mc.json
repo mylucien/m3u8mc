@@ -1,0 +1,15 @@
+{
+	"luci-app-m3u8mc": {
+		"description": "Grant access to m3u8mc configuration, status and logs",
+		"read": {
+			"uci": [ "m3u8mc", "network" ],
+			"file": {
+				"/usr/bin/m3u8mcctl": [ "exec" ],
+				"/sbin/logread": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "m3u8mc" ]
+		}
+	}
+}

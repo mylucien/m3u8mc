@@ -136,13 +136,22 @@ fn expect_ok(resp: Response) -> anyhow::Result<()> {
 fn print_status_human(status: &m3u8mc_common::protocol::DaemonStatus) {
     println!("uptime: {}s", status.uptime_secs);
     println!(
-        "{:<12} {:<8} {:<7} {:<10} {:<6} {:<8} {:<8} {}",
+        "{:<12} {:<8} {:<7} {:<10} {:<20} {:<8} {:<8} {}",
         "CHANNEL", "ENABLED", "RUNNING", "MODE", "CACHE", "RESTARTS", "OVERLOAD", "PLAY_URL"
     );
     for ch in &status.channels {
         println!(
-            "{:<12} {:<8} {:<7} {:<10} {:<6} {:<8} {:<8} {}",
-            ch.id, ch.enabled, ch.running, ch.mode, ch.cached_segments, ch.ffmpeg_restarts, ch.overloaded, ch.play_url
+            "{:<12} {:<8} {:<7} {:<10} {:<20} {:<8} {:<8} {}",
+            ch.id, ch.enabled, ch.running, ch.mode, cache_cell(ch), ch.ffmpeg_restarts, ch.overloaded, ch.play_url
         );
     }
+}
+
+/// CACHE 列：`分片数 存储类型 占用`，如 `5 disk 8.4M`；直通模式无缓存显示 `-`。
+fn cache_cell(ch: &m3u8mc_common::protocol::ChannelStatus) -> String {
+    if ch.cache_storage.is_empty() {
+        return "-".to_string();
+    }
+    let mb = ch.cache_bytes as f64 / 1_048_576.0;
+    format!("{} {} {:.1}M", ch.cached_segments, ch.cache_storage, mb)
 }

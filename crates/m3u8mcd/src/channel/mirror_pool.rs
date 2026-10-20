@@ -49,18 +49,15 @@ impl MirrorPool {
         })
     }
 
-    /// 热替换 server 列表（如 token 失效重新解析 master playlist 后地址发生变化）。
-    /// 新增的 server 初始化为健康状态；不再出现的 server 状态条目保留但不会再被选中。
-    ///
-    /// 问题2 修复后，下载 base（mirror_pool）不再随 Poller 解析结果动态变化
-    /// （list_url 只管拉列表，不再驱动 mirror_pool），当前没有调用方；
-    /// 保留这个方法是为了将来支持"运行时热更新 url 配置"这类场景，
-    /// 用 allow(dead_code) 消掉暂时的未使用警告。
-    #[allow(dead_code)]
+    /// 热替换 server 列表（如重新解析 master playlist 后各镜像 media playlist 地址变化，
+    /// 或 token 刷新导致地址变化）。新增的 server 初始化为健康状态；已保留的 server
+    /// 沿用原有的失败/退避状态；不再出现的 server 的状态条目会被清掉，
+    /// 避免 token 每次变化都留下一条永远不会再用的状态而缓慢增长。
     pub fn replace_servers(&self, new_servers: Vec<String>) {
         for s in &new_servers {
             self.state.entry(s.clone()).or_default();
         }
+        self.state.retain(|k, _| new_servers.contains(k));
         *self.servers.write().unwrap() = new_servers;
     }
 

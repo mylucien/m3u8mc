@@ -1,0 +1,23 @@
+{
+	"admin/services/m3u8mc": {
+		"title": "m3u8mc 转播",
+		"order": 60,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": [ "luci-app-m3u8mc" ], "uci": { "m3u8mc": true } }
+	},
+	"admin/services/m3u8mc/channels": {
+		"title": "频道管理",
+		"order": 10,
+		"action": { "type": "view", "path": "m3u8mc/channels" }
+	},
+	"admin/services/m3u8mc/status": {
+		"title": "运行状态",
+		"order": 20,
+		"action": { "type": "view", "path": "m3u8mc/status" }
+	},
+	"admin/services/m3u8mc/log": {
+		"title": "运行日志",
+		"order": 30,
+		"action": { "type": "view", "path": "m3u8mc/log" }
+	}
+}

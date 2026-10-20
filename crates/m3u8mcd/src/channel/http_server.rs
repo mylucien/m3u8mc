@@ -82,16 +82,16 @@ async fn playlist_handler(State(state): State<ServerState>) -> Response {
     body.push_str("#EXT-X-VERSION:3\n");
     let target_duration = recent
         .iter()
-        .filter_map(|s| state.cache.get(*s))
+        .filter_map(|s| state.cache.info(*s))
         .map(|s| s.duration_secs)
         .fold(1.0f32, f32::max)
         .ceil() as u32;
     body.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration.max(1)));
     body.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
     for seq in recent {
-        if let Some(seg) = state.cache.get(*seq) {
-            body.push_str(&format!("#EXTINF:{:.3},\n", seg.duration_secs));
-            body.push_str(&format!("{}/seg/{}.ts\n", state.http_path, seg.seq));
+        if let Some(info) = state.cache.info(*seq) {
+            body.push_str(&format!("#EXTINF:{:.3},\n", info.duration_secs));
+            body.push_str(&format!("{}/seg/{}.ts\n", state.http_path, seq));
         }
     }
 
@@ -108,8 +108,10 @@ async fn segment_handler(State(state): State<ServerState>, Path(seq_str): Path<S
         Ok(s) => s,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid segment id").into_response(),
     };
-    match state.cache.get(seq) {
-        Some(seg) => ([(header::CONTENT_TYPE, "video/mp2t")], seg.data.to_vec()).into_response(),
+    // Bytes 直接作为响应体：内存模式零拷贝（之前 to_vec() 每次请求都会整片复制一份），
+    // 磁盘模式下是一次文件读取。
+    match state.cache.read(seq).await {
+        Some(data) => ([(header::CONTENT_TYPE, "video/mp2t")], Body::from(data)).into_response(),
         None => (StatusCode::NOT_FOUND, "segment not found or evicted").into_response(),
     }
 }
@@ -141,8 +143,8 @@ async fn stream_handler(State(state): State<ServerState>) -> Response {
 
     let body_stream = async_stream::stream! {
         for seq in initial {
-            if let Some(seg) = cache.get(seq) {
-                yield Ok::<_, std::io::Error>(axum::body::Bytes::from(seg.data));
+            if let Some(data) = cache.read(seq).await {
+                yield Ok::<_, std::io::Error>(data);
             }
         }
 
@@ -212,8 +214,8 @@ async fn stream_handler(State(state): State<ServerState>) -> Response {
                     pending.remove(&front);
                 } else if front == exp {
                     pending.remove(&front);
-                    if let Some(seg) = cache.get(front) {
-                        yield Ok(axum::body::Bytes::from(seg.data));
+                    if let Some(data) = cache.read(front).await {
+                        yield Ok(data);
                     }
                     expected_next = Some(front + 1);
                 } else {

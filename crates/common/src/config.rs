@@ -29,6 +29,162 @@ impl std::str::FromStr for Protocol {
     }
 }
 
+/// 分片缓存的存放位置。
+/// - `Memory`：全部放在进程内存里（默认，最快，但占用 RAM）；
+/// - `Disk`：每个分片落成 `cache_dir` 下的一个文件，内存里只保留元数据，
+///   适合 RAM 很小、但挂了 USB/SD/硬盘的设备。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheStorage {
+    Memory,
+    Disk,
+}
+
+impl Default for CacheStorage {
+    fn default() -> Self {
+        CacheStorage::Memory
+    }
+}
+
+impl CacheStorage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CacheStorage::Memory => "memory",
+            CacheStorage::Disk => "disk",
+        }
+    }
+}
+
+impl std::str::FromStr for CacheStorage {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "memory" | "mem" | "ram" => Ok(CacheStorage::Memory),
+            "disk" | "file" | "dir" => Ok(CacheStorage::Disk),
+            other => Err(format!("unknown cache_storage: {other}")),
+        }
+    }
+}
+
+/// ffmpeg 结构化参数（LuCI「ffmpeg」页签对应的就是这组字段）。
+///
+/// 设计要点：
+/// - 每项都有默认值，未配置时等价于“电视盒子推荐组合”；
+/// - 字段按固定顺序展开成命令行，`ffmpeg_input_arg` / `ffmpeg_output_arg` 两个自由列表
+///   **追加在结构化参数之后**，用于补充本结构没覆盖的参数（ffmpeg 同名选项以后出现者为准，
+///   所以也可以用它覆盖结构化字段）；
+/// - 之前“只要写了任何输出参数，内置默认值就整体失效”的全有或全无行为已取消。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FfmpegOptions {
+    /// `-re`：按源原始帧率读取，避免读得过快导致推流速率失控
+    pub re: bool,
+    /// 输入格式 `-f`，空=自动探测；本地缓存模式的输入固定是 HLS，可填 `hls`
+    pub input_format: String,
+    /// `-analyzeduration`（微秒）
+    pub analyzeduration: u64,
+    /// `-probesize`（字节）
+    pub probesize: u64,
+    /// `-c copy`：不转码直接封装。关闭后 ffmpeg 会按默认编码器重新编码，CPU 占用极高
+    pub copy: bool,
+    /// `-bsf:v h264_mp4toannexb`：仅当源是 mp4 风格 H.264 时才需要
+    pub annexb: bool,
+    /// `-pcr_period`（毫秒），None=不设置
+    pub pcr_period: Option<u32>,
+    /// `-muxdelay`（秒）
+    pub muxdelay: Option<String>,
+    /// `-muxrate`，如 `6M`；None=不固定码率
+    pub muxrate: Option<String>,
+    /// `-pat_period`（秒）
+    pub pat_period: Option<String>,
+    /// `-sdt_period`（秒）
+    pub sdt_period: Option<String>,
+    /// `-mpegts_service_type`，空=不设置
+    pub service_type: String,
+    /// `-mpegts_flags`，空=不设置
+    pub mpegts_flags: String,
+}
+
+impl Default for FfmpegOptions {
+    fn default() -> Self {
+        FfmpegOptions {
+            re: true,
+            input_format: String::new(),
+            analyzeduration: 5_000_000,
+            probesize: 5_000_000,
+            copy: true,
+            annexb: false,
+            pcr_period: Some(20),
+            muxdelay: Some("0.7".to_string()),
+            muxrate: None,
+            pat_period: Some("0.5".to_string()),
+            sdt_period: Some("0.5".to_string()),
+            service_type: "digital_tv".to_string(),
+            mpegts_flags: "+initial_discontinuity+resend_headers".to_string(),
+        }
+    }
+}
+
+impl FfmpegOptions {
+    /// `-i` 之前的输入侧参数
+    pub fn input_args(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if self.re {
+            v.push("-re".to_string());
+        }
+        v.push("-analyzeduration".to_string());
+        v.push(self.analyzeduration.to_string());
+        v.push("-probesize".to_string());
+        v.push(self.probesize.to_string());
+        if !self.input_format.is_empty() {
+            v.push("-f".to_string());
+            v.push(self.input_format.clone());
+        }
+        v
+    }
+
+    /// `-i` 之后、`-f <muxer>` 之前的输出侧参数
+    pub fn output_args(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        let mut kv = |k: &str, val: String| {
+            v.push(k.to_string());
+            v.push(val);
+        };
+        if self.copy {
+            kv("-c", "copy".to_string());
+        }
+        if self.annexb {
+            kv("-bsf:v", "h264_mp4toannexb".to_string());
+        }
+        if let Some(x) = self.pcr_period {
+            kv("-pcr_period", x.to_string());
+        }
+        if let Some(x) = &self.muxdelay {
+            kv("-muxdelay", x.clone());
+        }
+        if let Some(x) = &self.muxrate {
+            kv("-muxrate", x.clone());
+        }
+        if let Some(x) = &self.pat_period {
+            kv("-pat_period", x.clone());
+        }
+        if let Some(x) = &self.sdt_period {
+            kv("-sdt_period", x.clone());
+        }
+        if !self.service_type.is_empty() {
+            kv("-mpegts_service_type", self.service_type.clone());
+        }
+        if !self.mpegts_flags.is_empty() {
+            kv("-mpegts_flags", self.mpegts_flags.clone());
+        }
+        v
+    }
+}
+
+/// 缓存目录默认的根目录。注意：OpenWrt（含 x86）上 /tmp 通常是 tmpfs（占用的仍是内存），
+/// 想真正省内存请把 cache_dir 指到 USB/SD/硬盘挂载点；daemon 启动磁盘缓存时会
+/// 实际检测目录所在文件系统，落在 tmpfs/ramfs 上会记一条警告。
+pub const DEFAULT_CACHE_DIR: &str = "/tmp/m3u8mc";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalConfig {
     pub enabled: bool,
@@ -39,6 +195,9 @@ pub struct GlobalConfig {
     /// 空字符串 → 从 PATH 查找系统 ffmpeg；
     /// 非空 → 直接使用该路径（通常是 /usr/local/bin/ffmpeg 下载的全功能版本）。
     pub ffmpeg_bin: String,
+    /// 磁盘缓存的根目录（各频道在其下用频道 id 建子目录）。
+    /// 频道自己没配置 cache_dir 时使用；仅 cache_storage=disk 的频道会用到。
+    pub cache_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,11 +212,16 @@ pub struct ChannelConfig {
     pub iface: String,
     pub ttl: u8,
     pub pkt_size: u32,
-    pub buffer_size: u32,
     pub threads: usize,
     pub cache_window: u32,
     pub max_segments: usize,
     pub hls_segments: usize,
+    /// 分片缓存放内存还是本地目录。UCI: option cache_storage 'memory'|'disk'
+    pub cache_storage: CacheStorage,
+    /// 磁盘缓存的最终目录（= 频道 cache_dir 或全局 cache_dir，再拼上频道 id 子目录），
+    /// 在配置加载阶段一次性算好；cache_storage=memory 时不使用。
+    /// UCI: option cache_dir '/mnt/sda1/m3u8mc'
+    pub cache_dir: String,
     pub http_port: Option<u16>,
     pub http_path: String,
     pub use_downloader: bool,
@@ -87,9 +251,30 @@ pub struct ChannelConfig {
     pub list_poll_interval_secs: f32,
     pub list_proxy: String,
     pub download_proxy: String,
+    /// UDP/RTP 输出套接字发送缓冲（字节），写进输出 URL 的 buffer_size=。
+    /// 实际生效值受内核 net.core.wmem_max 限制；设置很大的值时需同时调高该 sysctl。
+    pub buffer_size: u32,
+    /// ffmpeg 结构化参数
+    pub ffmpeg: FfmpegOptions,
+    /// 额外输入参数（追加在结构化输入参数之后、`-i` 之前）
     pub ffmpeg_input_args: Vec<String>,
+    /// 额外输出参数（追加在结构化输出参数之后）
     pub ffmpeg_output_args: Vec<String>,
+    /// 传给 ffmpeg 的 `-loglevel`，已校验并转小写；默认 `warning`。
+    /// UCI: option ffmpeg_loglevel 'error'
+    pub ffmpeg_loglevel: String,
+    /// 是否把 ffmpeg 的 stderr 逐行转发进 daemon 日志（tracing debug 级别）。
+    /// 关闭后 stderr 仍会被读取并用于致命关键字检测，只是不再写入 daemon 日志。
+    /// UCI: option ffmpeg_log_forward '0'
+    pub ffmpeg_log_forward: bool,
 }
+
+/// ffmpeg `-loglevel` 的合法取值（不含 `+flags` 前缀写法）。
+pub const FFMPEG_LOGLEVELS: &[&str] =
+    &["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug", "trace"];
+
+/// 默认的 ffmpeg 日志级别，与此前写死在命令行里的值一致。
+pub const DEFAULT_FFMPEG_LOGLEVEL: &str = "warning";
 
 /// 校验一个"候选覆盖"字符串是否为合法的 `scheme://host[:port]` 或 `host[:port]` 形式
 /// （不允许带 path/query/fragment）。
@@ -163,6 +348,13 @@ pub fn parse_race_ip_entry(entry: &str) -> (String, Option<String>) {
 }
 
 impl ChannelConfig {
+    /// 当前 `-loglevel` 下，健康运行的 ffmpeg 是否本来就几乎不输出任何日志。
+    /// `error` 及以下（含 fatal/panic/quiet）时，正常推流不会产生日志行，
+    /// 此时“日志静默”不能当作卡死的信号，否则会无限重启正常工作的频道。
+    pub fn ffmpeg_silence_is_normal(&self) -> bool {
+        matches!(self.ffmpeg_loglevel.as_str(), "quiet" | "panic" | "fatal" | "error")
+    }
+
     /// 实际用于拉取列表（Poller）的源地址：
     /// 优先使用独立配置的 list_urls，未配置时回退到 urls（向后兼容旧配置，
     /// 即"只填 url 无 list_url"时 url 同时承担列表源的职责）。
@@ -238,6 +430,12 @@ pub enum ConfigError {
     ProxyOnlyRequiresDownloader(String),
     #[error("channel '{0}': invalid protocol")]
     InvalidProtocol(String),
+    #[error("channel '{0}': 没有配置任何 url（标准模式至少需要 url 或 list_url 之一，直通模式需要一个 url）")]
+    NoSourceUrl(String),
+    #[error("channel '{0}': 选项 {1} 的值 '{2}' 不合法")]
+    InvalidFfmpegOption(String, String, String),
+    #[error("channel '{0}': invalid cache_storage '{1}' (expected 'memory' or 'disk')")]
+    InvalidCacheStorage(String, String),
 }
 
 pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
@@ -261,6 +459,10 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
         ffmpeg_bin: global_section
             .map(|s| s.get_or("ffmpeg_bin", ""))
             .unwrap_or_default(),
+        cache_dir: global_section
+            .map(|s| s.get_or("cache_dir", DEFAULT_CACHE_DIR))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string()),
     };
 
     let mut channels = Vec::new();
@@ -293,6 +495,18 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
         if proxy_only && !use_downloader {
             return Err(ConfigError::ProxyOnlyRequiresDownloader(id));
         }
+        // 没有任何源地址的频道永远起不来：标准模式 Poller 每 5 秒空转报一次
+        // "channel has no configured list url"，直通模式 ffmpeg 拿到空输入直接退出重启。
+        // 与其运行时反复报错，不如在加载配置时就明确拒绝。
+        let has_list_url = sec.list("list_url").iter().any(|s| !s.is_empty());
+        let has_any_url = urls.iter().any(|s| !s.is_empty());
+        if use_downloader {
+            if !has_any_url && !has_list_url {
+                return Err(ConfigError::NoSourceUrl(id));
+            }
+        } else if !has_any_url {
+            return Err(ConfigError::NoSourceUrl(id));
+        }
 
         // proxy_only 模式不组播推流，protocol 字段完全用不上；此时即便用户手滑填了
         // 非法值，也不应该因为一个无关字段导致整个频道解析失败——直接忽略、退回默认值。
@@ -302,6 +516,29 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
             Err(_) if proxy_only => Protocol::Rtp,
             Err(_) => return Err(ConfigError::InvalidProtocol(id)),
         };
+
+        let ffmpeg = parse_ffmpeg_options(&id, &sec)?;
+
+        // 空串/未配置 = 默认 warning；写错的值直接拒绝，避免原样塞进 ffmpeg 命令行导致起不来
+        let ffmpeg_loglevel = match sec.get("ffmpeg_loglevel").map(|s| s.trim().to_ascii_lowercase()) {
+            None => DEFAULT_FFMPEG_LOGLEVEL.to_string(),
+            Some(v) if v.is_empty() => DEFAULT_FFMPEG_LOGLEVEL.to_string(),
+            Some(v) if FFMPEG_LOGLEVELS.contains(&v.as_str()) => v,
+            Some(v) => {
+                return Err(ConfigError::InvalidFfmpegOption(id, "ffmpeg_loglevel".to_string(), v));
+            }
+        };
+
+        let cache_storage_raw = sec.get_or("cache_storage", "memory");
+        let cache_storage = cache_storage_raw
+            .parse::<CacheStorage>()
+            .map_err(|_| ConfigError::InvalidCacheStorage(id.clone(), cache_storage_raw.clone()))?;
+        let cache_dir_base = sec
+            .get("cache_dir")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| global.cache_dir.clone());
+        let cache_dir = channel_cache_dir(&cache_dir_base, &id);
 
         let http_port = if use_downloader {
             match sec.get("http_port").filter(|s| !s.is_empty()) {
@@ -348,11 +585,12 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
             iface: sec.get_or("iface", "lan"),
             ttl: sec.get_parsed("ttl", 4u8),
             pkt_size: sec.get_parsed("pkt_size", 1316u32),
-            buffer_size: sec.get_parsed("buffer_size", 1_048_576u32),
             threads: sec.get_parsed("threads", 4usize),
             cache_window: sec.get_parsed("cache_window", 3u32),
             max_segments: sec.get_parsed("max_segments", 5usize),
             hls_segments: sec.get_parsed("hls_segments", 3usize),
+            cache_storage,
+            cache_dir,
             http_port,
             http_path: sec.get("http_path").filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| "/live".to_string()),
             use_downloader,
@@ -367,8 +605,13 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
             list_poll_interval_secs: sec.get_parsed("list_poll_interval", 0.0f32),
             list_proxy: sec.get_or("list_proxy", ""),
             download_proxy: sec.get_or("download_proxy", ""),
+            buffer_size: sec.get_parsed("buffer_size", 1_048_576u32),
+            ffmpeg,
             ffmpeg_input_args: sec.list("ffmpeg_input_arg").iter().filter(|s| !s.is_empty()).cloned().collect(),
             ffmpeg_output_args: sec.list("ffmpeg_output_arg").iter().filter(|s| !s.is_empty()).cloned().collect(),
+            ffmpeg_loglevel,
+            // 默认转发，保持升级前的行为（日志级别为 debug 时可见 ffmpeg 输出）
+            ffmpeg_log_forward: sec.get_bool("ffmpeg_log_forward", true),
         };
         channels.push(channel);
     }
@@ -377,6 +620,81 @@ pub fn from_uci(uci: &UciConfig) -> Result<Config, ConfigError> {
         global,
         channels,
     })
+}
+
+/// 解析 ffmpeg 结构化选项。选项不存在 = 用默认值；存在但为空串 = 关闭该参数。
+/// 数值类做格式校验，避免把 "abc" 之类原样塞进 ffmpeg 命令行导致进程起不来。
+fn parse_ffmpeg_options(id: &str, sec: &crate::uci::UciSection) -> Result<FfmpegOptions, ConfigError> {
+    let d = FfmpegOptions::default();
+    let bad = |k: &str, v: &str| ConfigError::InvalidFfmpegOption(id.to_string(), k.to_string(), v.to_string());
+
+    let opt_num = |key: &str, default: Option<String>| -> Result<Option<String>, ConfigError> {
+        match sec.get(key) {
+            None => Ok(default),
+            Some(v) if v.trim().is_empty() => Ok(None),
+            Some(v) => {
+                let t = v.trim();
+                match t.parse::<f32>() {
+                    Ok(f) if f >= 0.0 && f.is_finite() => Ok(Some(t.to_string())),
+                    _ => Err(bad(key, t)),
+                }
+            }
+        }
+    };
+
+    let pcr_period = match sec.get("ffmpeg_pcr_period") {
+        None => d.pcr_period,
+        Some(v) if v.trim().is_empty() => None,
+        Some(v) => Some(v.trim().parse::<u32>().map_err(|_| bad("ffmpeg_pcr_period", v.trim()))?),
+    };
+
+    let muxrate = match sec.get("ffmpeg_muxrate") {
+        None => None,
+        Some(v) if v.trim().is_empty() => None,
+        Some(v) => {
+            let t = v.trim();
+            let (num, suffix) = match t.char_indices().last() {
+                Some((i, c)) if c.is_ascii_alphabetic() => (&t[..i], Some(c)),
+                _ => (t, None),
+            };
+            let suffix_ok = suffix.map_or(true, |c| matches!(c, 'k' | 'K' | 'm' | 'M'));
+            if !suffix_ok || num.is_empty() || num.parse::<f32>().map_or(true, |f| f <= 0.0) {
+                return Err(bad("ffmpeg_muxrate", t));
+            }
+            Some(t.to_string())
+        }
+    };
+
+    let input_format = sec.get("ffmpeg_input_format").map(|s| s.trim().to_string()).unwrap_or(d.input_format.clone());
+    if input_format.starts_with('-') {
+        return Err(bad("ffmpeg_input_format", &input_format));
+    }
+
+    Ok(FfmpegOptions {
+        re: sec.get_bool("ffmpeg_re", d.re),
+        input_format,
+        analyzeduration: sec.get_parsed("ffmpeg_analyzeduration", d.analyzeduration),
+        probesize: sec.get_parsed("ffmpeg_probesize", d.probesize),
+        copy: sec.get_bool("ffmpeg_copy", d.copy),
+        annexb: sec.get_bool("ffmpeg_annexb", d.annexb),
+        pcr_period,
+        muxdelay: opt_num("ffmpeg_muxdelay", d.muxdelay.clone())?,
+        muxrate,
+        pat_period: opt_num("ffmpeg_pat_period", d.pat_period.clone())?,
+        sdt_period: opt_num("ffmpeg_sdt_period", d.sdt_period.clone())?,
+        service_type: sec.get("ffmpeg_service_type").map(|s| s.trim().to_string()).unwrap_or(d.service_type.clone()),
+        mpegts_flags: sec.get("ffmpeg_mpegts_flags").map(|s| s.trim().to_string()).unwrap_or(d.mpegts_flags.clone()),
+    })
+}
+
+/// 频道磁盘缓存目录 = 根目录 / 频道 id（id 里的非常规字符替换为 `_`，避免路径穿越）。
+/// 始终使用独立子目录，保证多个频道、或多个频道共用同一个根目录时互不干扰。
+pub fn channel_cache_dir(base: &str, id: &str) -> String {
+    let safe_id: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    format!("{}/{}", base.trim_end_matches('/'), safe_id)
 }
 
 /// 计算两份配置之间频道级别的差异，供 reload 时做增量处理（见设计文档 3.2）。
@@ -575,6 +893,124 @@ config channel 'ch1'
         assert!(matches!(err, ConfigError::InvalidProtocol(id) if id == "ch1"));
     }
 
+    #[test]
+    fn channel_without_any_url_is_rejected() {
+        let std_mode = "config channel 'a'\n    option addr '239.0.0.1'\n    option port '1234'\n";
+        assert!(matches!(parse_str(std_mode).unwrap_err(), ConfigError::NoSourceUrl(id) if id == "a"));
+        let passthrough = "config channel 'b'\n    option use_downloader '0'\n    option addr '239.0.0.1'\n    option port '1234'\n    list list_url 'http://x/p.m3u8'\n";
+        // 直通模式只看 url，list_url 对它没有意义
+        assert!(matches!(parse_str(passthrough).unwrap_err(), ConfigError::NoSourceUrl(id) if id == "b"));
+    }
+
+    #[test]
+    fn standard_mode_with_only_list_url_is_accepted() {
+        let input = "config channel 'a'\n    option addr '239.0.0.1'\n    option port '1234'\n    list list_url 'http://x/p.m3u8'\n";
+        assert!(parse_str(input).is_ok());
+    }
+
+    #[test]
+    fn cache_storage_defaults_to_memory_and_parses_disk() {
+        let mem = "config channel 'a'\n    option addr '239.0.0.1'\n    option port '1234'\n    list url 'http://x/p.m3u8'\n";
+        let cfg = parse_str(mem).unwrap();
+        assert_eq!(cfg.channels[0].cache_storage, CacheStorage::Memory);
+
+        let disk = "config global\n    option cache_dir '/mnt/usb/cache/'\nconfig channel 'a b'\n    option addr '239.0.0.1'\n    option port '1234'\n    option cache_storage 'disk'\n    list url 'http://x/p.m3u8'\n";
+        let cfg = parse_str(disk).unwrap();
+        assert_eq!(cfg.channels[0].cache_storage, CacheStorage::Disk);
+        // 全局根目录 + 频道 id 子目录（id 中的非常规字符被替换）
+        assert_eq!(cfg.channels[0].cache_dir, "/mnt/usb/cache/a_b");
+    }
+
+    #[test]
+    fn channel_cache_dir_overrides_global_and_invalid_storage_rejected() {
+        let input = "config global\n    option cache_dir '/g'\nconfig channel 'c1'\n    option addr '239.0.0.1'\n    option port '1234'\n    option cache_storage 'disk'\n    option cache_dir '/mnt/own'\n    list url 'http://x/p.m3u8'\n";
+        let cfg = parse_str(input).unwrap();
+        assert_eq!(cfg.channels[0].cache_dir, "/mnt/own/c1");
+
+        let bad = "config channel 'c1'\n    option addr '239.0.0.1'\n    option port '1234'\n    option cache_storage 'tape'\n    list url 'http://x/p.m3u8'\n";
+        assert!(matches!(parse_str(bad).unwrap_err(), ConfigError::InvalidCacheStorage(id, v) if id == "c1" && v == "tape"));
+    }
+
+    #[test]
+    fn channel_cache_dir_sanitizes_id() {
+        assert_eq!(channel_cache_dir("/x/", "../evil"), "/x/___evil");
+    }
+
+    const USER_CONFIG: &str = r#"
+config global
+    option enabled '1'
+    option log_level 'error'
+    option control_socket '/var/run/m3u8mcd.sock'
+    option http_port_base '18080'
+    #option ffmpeg_bin ''
+
+config channel 'amty'
+    option enabled '1'
+    option name 'amty'
+    list url 'http://am.321288.xyz:2086/ch4/sport_ch4.live/playlist.m3u8'
+    option protocol 'rtp'
+    option addr '239.255.1.1'
+    option port '1234'
+    option iface '10.100.0.3'
+    option ttl '3'
+    option pkt_size '1316'
+    option buffer_size '41943040'
+    option threads '16'
+    option cache_window '3'
+    option max_segments '3'
+    option hls_segments '3'
+    option use_downloader '1'
+    option http_path '/live'
+    option race_mode '0'     # 赛马模式打开
+    list race_ip 'https://172.64.53.54'
+    list race_ip 'https://cdn6.cc.cd'
+    option list_proxy ''
+    option download_proxy ''
+    list ffmpeg_input_arg '-re'                # 注释
+    list ffmpeg_input_arg '-extension_picky'
+    list ffmpeg_input_arg '0'
+    list ffmpeg_output_arg '-muxrate'
+    list ffmpeg_output_arg '6M'
+"#;
+
+    #[test]
+    fn real_world_user_config_still_parses_and_keeps_buffer_size() {
+        let cfg = parse_str(USER_CONFIG).unwrap();
+        let c = &cfg.channels[0];
+        assert_eq!(c.buffer_size, 41_943_040);
+        assert_eq!(c.threads, 16);
+        assert_eq!(c.ffmpeg_input_args, vec!["-re", "-extension_picky", "0"]);
+        assert_eq!(c.ffmpeg_output_args, vec!["-muxrate", "6M"]);
+    }
+
+    #[test]
+    fn ffmpeg_defaults_copy_codec_and_tuned_muxer_params() {
+        let o = FfmpegOptions::default();
+        let out = o.output_args().join(" ");
+        // 回归：默认必须 -c copy，否则 ffmpeg 会把视频重新编码成 mpeg2
+        assert!(out.starts_with("-c copy"));
+        assert!(out.contains("-pcr_period 20") && out.contains("-muxdelay 0.7"));
+        assert!(out.contains("-mpegts_flags +initial_discontinuity+resend_headers"));
+        assert!(!out.contains("-muxrate") && !out.contains("-bsf:v"));
+        assert_eq!(o.input_args().join(" "), "-re -analyzeduration 5000000 -probesize 5000000");
+    }
+
+    #[test]
+    fn ffmpeg_fields_override_disable_and_validate() {
+        let input = "config channel 'a'\n    option addr '239.0.0.1'\n    option port '1234'\n    list url 'http://x/p.m3u8'\n    option ffmpeg_re '0'\n    option ffmpeg_input_format 'hls'\n    option ffmpeg_muxrate '6M'\n    option ffmpeg_pcr_period ''\n    option ffmpeg_muxdelay '1.5'\n    option ffmpeg_annexb '1'\n    option ffmpeg_service_type ''\n";
+        let c = &parse_str(input).unwrap().channels[0];
+        assert_eq!(c.ffmpeg.input_args().join(" "), "-analyzeduration 5000000 -probesize 5000000 -f hls");
+        let out = c.ffmpeg.output_args().join(" ");
+        assert!(out.contains("-bsf:v h264_mp4toannexb") && out.contains("-muxrate 6M") && out.contains("-muxdelay 1.5"));
+        assert!(!out.contains("-pcr_period"), "空串表示关闭该参数");
+        assert!(!out.contains("-mpegts_service_type"));
+
+        for (k, v) in [("ffmpeg_muxrate", "fast"), ("ffmpeg_muxdelay", "abc"), ("ffmpeg_pcr_period", "-3"), ("ffmpeg_input_format", "-vf")] {
+            let bad = format!("config channel 'a'\n    option addr '239.0.0.1'\n    option port '1234'\n    list url 'http://x/p.m3u8'\n    option {k} '{v}'\n");
+            assert!(matches!(parse_str(&bad).unwrap_err(), ConfigError::InvalidFfmpegOption(..)), "{k}={v} 应被拒绝");
+        }
+    }
+
     fn default_test_channel() -> ChannelConfig {
         ChannelConfig {
             id: "test".to_string(),
@@ -587,11 +1023,12 @@ config channel 'ch1'
             iface: "lan".to_string(),
             ttl: 4,
             pkt_size: 1316,
-            buffer_size: 1_048_576,
             threads: 4,
             cache_window: 3,
             max_segments: 5,
             hls_segments: 3,
+            cache_storage: CacheStorage::Memory,
+            cache_dir: String::new(),
             http_port: None,
             http_path: "/live".to_string(),
             use_downloader: true,
@@ -606,8 +1043,44 @@ config channel 'ch1'
             list_poll_interval_secs: 0.0,
             list_proxy: String::new(),
             download_proxy: String::new(),
+            buffer_size: 1_048_576,
+            ffmpeg: FfmpegOptions::default(),
             ffmpeg_input_args: vec![],
             ffmpeg_output_args: vec![],
+            ffmpeg_loglevel: DEFAULT_FFMPEG_LOGLEVEL.to_string(),
+            ffmpeg_log_forward: true,
         }
+    }
+
+    #[test]
+    fn ffmpeg_log_options_defaults_and_validation() {
+        let base = "config channel 'a'\n    option addr '239.0.0.1'\n    option port '1234'\n    list url 'http://x/p.m3u8'\n";
+        let d = parse_str(base).unwrap().channels.remove(0);
+        assert_eq!(d.ffmpeg_loglevel, "warning");
+        assert!(d.ffmpeg_log_forward, "默认转发，保持旧行为");
+        assert!(!d.ffmpeg_silence_is_normal());
+
+        let c = parse_str(&format!("{base}    option ffmpeg_loglevel 'ERROR'\n    option ffmpeg_log_forward '0'\n"))
+            .unwrap()
+            .channels
+            .remove(0);
+        assert_eq!(c.ffmpeg_loglevel, "error");
+        assert!(!c.ffmpeg_log_forward);
+        assert!(c.ffmpeg_silence_is_normal());
+
+        // 空串回到默认值
+        let e = parse_str(&format!("{base}    option ffmpeg_loglevel ''\n")).unwrap().channels.remove(0);
+        assert_eq!(e.ffmpeg_loglevel, "warning");
+
+        // 非法值（含想夹带参数的写法）必须被拒绝
+        for v in ["warn", "-i", "error -vf x", "loud"] {
+            let bad = format!("{base}    option ffmpeg_loglevel '{v}'\n");
+            assert!(matches!(parse_str(&bad).unwrap_err(), ConfigError::InvalidFfmpegOption(..)), "{v} 应被拒绝");
+        }
+
+        // 日志选项变化必须体现在频道 diff 里（改了要重启该频道才生效）
+        let a = parse_str(base).unwrap();
+        let b = parse_str(&format!("{base}    option ffmpeg_loglevel 'error'\n")).unwrap();
+        assert_eq!(diff_channels(&a, &b).changed, vec!["a".to_string()]);
     }
 }

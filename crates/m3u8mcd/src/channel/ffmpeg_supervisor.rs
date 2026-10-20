@@ -92,6 +92,8 @@ impl FfmpegSupervisor {
         let mut params = Vec::new();
         params.push(format!("ttl={}", self.channel.ttl));
         params.push(format!("pkt_size={}", self.channel.pkt_size));
+        // 输出套接字发送缓冲（字节）。注意内核会把它截断到 net.core.wmem_max，
+        // 配很大的值时需要同时 `sysctl -w net.core.wmem_max=...` 才真正生效。
         params.push(format!("buffer_size={}", self.channel.buffer_size));
         if let Some(ip) = local_ip {
             params.push(format!("localaddr={ip}"));
@@ -110,33 +112,26 @@ impl FfmpegSupervisor {
             self.ffmpeg_bin.clone()
         };
         let mut cmd = Command::new(&bin);
-        cmd.arg("-hide_banner").arg("-loglevel").arg("warning").arg("-nostats");
+        // -loglevel 来自频道配置（默认 warning）。放在最前面，用户的 ffmpeg_input_arg 里
+        // 再写 -loglevel 时以后出现者为准。
+        cmd.arg("-hide_banner").arg("-loglevel").arg(&self.channel.ffmpeg_loglevel).arg("-nostats");
 
-        // 输入侧参数。注意：-extension_picky 在部分 ffmpeg 发行版/版本里并不存在
-        // （命中则会报 Unrecognized option 导致进程直接退出），且 InternalHttpServer
-        // 统一用 seg/{seq}.ts 命名，本身不存在扩展名嗅探歧义，因此默认不再附加该参数；
-        // 如目标固件的 ffmpeg 支持该选项，可通过 ffmpeg_input_arg 自行追加。
-        cmd.arg("-analyzeduration").arg("5000000");
-        cmd.arg("-probesize").arg("5000000");
+        // 参数顺序：结构化参数（ChannelConfig.ffmpeg，LuCI「ffmpeg」页签）在前，
+        // 自由列表 ffmpeg_input_arg / ffmpeg_output_arg 追加在后，用来补充结构化字段
+        // 没覆盖的参数（如部分发行版才支持的 -extension_picky），同名选项以后出现者为准。
+        for arg in self.channel.ffmpeg.input_args() {
+            cmd.arg(arg);
+        }
         for arg in &self.channel.ffmpeg_input_args {
             cmd.arg(arg);
         }
         cmd.arg("-i").arg(&self.input_url);
 
-        // 输出侧参数（1.9 节兼容性调优组合，作为高级选项默认值，由 LuCI 预填，
-        // 这里同样兜底应用一份，避免空配置时完全没有这些关键参数）
-        if self.channel.ffmpeg_output_args.is_empty() {
-            cmd.arg("-pcr_period").arg("20");
-            cmd.arg("-muxdelay").arg("0.7");
-            cmd.arg("-bsf:v").arg("h264_mp4toannexb");
-            cmd.arg("-pat_period").arg("0.5");
-            cmd.arg("-sdt_period").arg("0.5");
-            cmd.arg("-mpegts_service_type").arg("digital_tv");
-            cmd.arg("-mpegts_flags").arg("+initial_discontinuity+resend_headers");
-        } else {
-            for arg in &self.channel.ffmpeg_output_args {
-                cmd.arg(arg);
-            }
+        for arg in self.channel.ffmpeg.output_args() {
+            cmd.arg(arg);
+        }
+        for arg in &self.channel.ffmpeg_output_args {
+            cmd.arg(arg);
         }
 
         // muxer 必须跟协议匹配：
@@ -214,7 +209,7 @@ impl FfmpegSupervisor {
                 self.status.pid.store(pid, Ordering::Relaxed);
             }
             self.status.running.store(true, Ordering::Relaxed);
-            tracing::info!(channel = %self.channel.id, "ffmpeg started");
+            tracing::info!("ffmpeg started");
 
             let exit_reason = self.supervise_child(&mut child, &mut stop_rx).await;
             self.status.running.store(false, Ordering::Relaxed);
@@ -226,7 +221,7 @@ impl FfmpegSupervisor {
                 return;
             }
 
-            tracing::warn!(channel = %self.channel.id, reason = ?exit_reason, "ffmpeg stopped, restarting after delay");
+            tracing::warn!(reason = ?exit_reason, "ffmpeg stopped, restarting after delay");
             if wait_or_stop(&mut stop_rx, RESTART_DELAY).await {
                 return;
             }
@@ -241,6 +236,12 @@ impl FfmpegSupervisor {
             None => return "no-stderr",
         };
         let mut lines = BufReader::new(stderr).lines();
+        // 是否把 ffmpeg 输出写进 daemon 日志。关闭时 stderr 依旧必须读取并扫描：
+        // 致命关键字检测和活动时间戳都依赖它，而且不读会让管道写满、ffmpeg 阻塞。
+        let forward = self.channel.ffmpeg_log_forward;
+        // loglevel 在 error 及以下时，健康的 ffmpeg 本来就不输出日志，
+        // 此时“日志静默”不再代表卡死，关闭静默看门狗，否则会每 30s 重启一次正常频道。
+        let silence_watchdog = !self.channel.ffmpeg_silence_is_normal();
         let (activity_tx, mut activity_rx) = watch::channel(());
         let (fatal_tx, mut fatal_rx) = watch::channel(false);
 
@@ -249,11 +250,13 @@ impl FfmpegSupervisor {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
                         let _ = activity_tx.send(());
-                        tracing::debug!(channel = %self.channel_id(), "ffmpeg: {line}");
+                        if forward {
+                            tracing::debug!("ffmpeg: {line}");
+                        }
                         if IGNORE_LOG_PATTERNS.iter().any(|kw| line.contains(kw)) {
                             // 良性噪声（DTS 抖动、重复行折叠提示等），跳过 fatal 判断
                         } else if FATAL_LOG_KEYWORDS.iter().any(|kw| line.contains(kw)) {
-                            tracing::warn!(channel = %self.channel_id(), "ffmpeg fatal keyword matched: {line}");
+                            tracing::warn!("ffmpeg fatal keyword matched: {line}");
                             let _ = fatal_tx.send(true);
                             // 不 break：让 log_task 继续读到 EOF，避免与 fatal_rx.changed()
                             // 分支同时就绪导致 select! 随机选择，误导排障日志
@@ -284,12 +287,12 @@ impl FfmpegSupervisor {
                         Err(_) => "wait-error",
                     };
                 }
-                _ = tokio::time::sleep(LOG_SILENCE_TIMEOUT) => {
+                _ = tokio::time::sleep(LOG_SILENCE_TIMEOUT), if silence_watchdog => {
                     if activity_rx.has_changed().unwrap_or(false) {
                         let _ = activity_rx.borrow_and_update();
                         continue;
                     }
-                    tracing::warn!(channel = %self.channel_id(), "ffmpeg log silent for {:?}, assuming stuck", LOG_SILENCE_TIMEOUT);
+                    tracing::warn!("ffmpeg log silent for {:?}, assuming stuck", LOG_SILENCE_TIMEOUT);
                     return "log-silent-stuck";
                 }
                 _ = stop_rx.changed() => {
@@ -300,15 +303,66 @@ impl FfmpegSupervisor {
             }
         }
     }
-
-    fn channel_id(&self) -> &str {
-        &self.channel.id
-    }
 }
 
 async fn wait_or_stop(stop_rx: &mut watch::Receiver<bool>, duration: Duration) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(duration) => false,
         _ = stop_rx.changed() => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn supervisor(extra: &str) -> Arc<FfmpegSupervisor> {
+        let text = format!(
+            "config channel 'a'\n    option addr '239.255.1.1'\n    option port '1234'\n    list url 'http://x/p.m3u8'\n    option buffer_size '41943040'\n{extra}"
+        );
+        let cfg = m3u8mc_common::config::parse_str(&text).unwrap();
+        FfmpegSupervisor::new(cfg.channels[0].clone(), "http://127.0.0.1:18080/live/playlist.m3u8".into(), false, String::new())
+    }
+
+    fn args(sup: &FfmpegSupervisor) -> Vec<String> {
+        sup.build_command(Some("10.0.0.3"))
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn command_order_structured_then_extra_and_input_before_output() {
+        let sup = supervisor("    list ffmpeg_input_arg '-extension_picky'\n    list ffmpeg_input_arg '0'\n    list ffmpeg_output_arg '-muxrate'\n    list ffmpeg_output_arg '6M'\n");
+        let a = args(&sup);
+        let pos = |x: &str| a.iter().position(|v| v == x).unwrap_or_else(|| panic!("missing {x} in {a:?}"));
+        let i = pos("-i");
+        assert!(pos("-re") < pos("-extension_picky") && pos("-extension_picky") < i, "输入参数必须在 -i 之前");
+        assert!(pos("-c") > i && pos("-pcr_period") > i, "输出参数必须在 -i 之后");
+        assert!(pos("-muxrate") > pos("-mpegts_flags"), "额外输出参数追加在结构化参数之后");
+        // 默认 rtp 协议 → rtp_mpegts，buffer_size 取用户配置
+        assert!(a.contains(&"rtp_mpegts".to_string()));
+        assert!(a.last().unwrap().contains("buffer_size=41943040") && a.last().unwrap().contains("localaddr=10.0.0.3"));
+    }
+
+    #[test]
+    fn loglevel_defaults_to_warning_and_follows_channel_config() {
+        let a = args(&supervisor(""));
+        let i = a.iter().position(|v| v == "-loglevel").expect("缺少 -loglevel");
+        assert_eq!(a[i + 1], "warning", "默认值必须与改动前写死的一致");
+
+        let a = args(&supervisor("    option ffmpeg_loglevel 'error'\n"));
+        let i = a.iter().position(|v| v == "-loglevel").unwrap();
+        assert_eq!(a[i + 1], "error");
+        // -loglevel 必须在 -i 之前，作用于整个进程
+        assert!(i < a.iter().position(|v| v == "-i").unwrap());
+    }
+
+    #[test]
+    fn empty_extra_args_still_get_copy_codec() {
+        let a = args(&supervisor(""));
+        let c = a.iter().position(|v| v == "-c").expect("缺少 -c copy 会导致 ffmpeg 转码");
+        assert_eq!(a[c + 1], "copy");
     }
 }
